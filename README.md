@@ -1,5 +1,7 @@
 ﻿# OldWays
 
+![OldWays](docs/preview.png)
+
 OldWays is a tiny native Windows widget that shows what Spotify is playing and controls it. It sits on your desktop, wears the colors of the album art, and uses almost no memory or CPU.
 
 **Website: https://notkazhons.github.io/OldWays/**
