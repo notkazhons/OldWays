@@ -34,7 +34,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_LEFT,
     VK_RIGHT, VK_SPACE,
 };
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -383,6 +386,32 @@ fn start_spotify_sign_in() {
     }
 }
 
+/// Put `text` on the clipboard as Unicode text.
+fn copy_text(hwnd: HWND, text: &str) -> bool {
+    const CF_UNICODETEXT: u32 = 13;
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        if OpenClipboard(Some(hwnd)).is_err() {
+            return false;
+        }
+        let _ = EmptyClipboard();
+        let ok = (|| {
+            let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).ok()?;
+            let dst = GlobalLock(mem) as *mut u16;
+            if dst.is_null() {
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+            let _ = GlobalUnlock(mem);
+            // The clipboard owns the memory once this succeeds.
+            SetClipboardData(CF_UNICODETEXT, Some(HANDLE(mem.0))).ok()
+        })()
+        .is_some();
+        let _ = CloseClipboard();
+        ok
+    }
+}
+
 fn tray_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
@@ -426,6 +455,7 @@ fn tray_menu(hwnd: HWND) {
 #[derive(Clone, Copy, PartialEq)]
 enum Button {
     Like,
+    Copy,
     Shuffle,
     Prev,
     Toggle,
@@ -510,6 +540,8 @@ fn button_rect(hwnd: HWND, b: Button) -> RECT {
         Button::Seek => bar_rect(hwnd),
         // Heart at the right end of the title row.
         Button::Like => row_at(26, width() - 12 - LIKE_W, width() - 12, 20),
+        // Left of the heart, same row.
+        Button::Copy => row_at(26, width() - 12 - 2 * LIKE_W, width() - 12 - LIKE_W, 20),
         // Top-right group, left of the pin: minimize, then lyrics.
         Button::Minimize | Button::Lyrics => {
             let p = pin_rect(hwnd);
@@ -533,6 +565,7 @@ fn button_at(hwnd: HWND, p: POINT) -> Option<Button> {
         Button::Volume,
         Button::Seek,
         Button::Like,
+        Button::Copy,
         Button::Lyrics,
         Button::Minimize,
         Button::Pin,
@@ -574,6 +607,26 @@ fn activate(hwnd: HWND, b: Button) {
             let _ = DestroyWindow(hwnd);
         },
         // No taskbar entry, so minimize hides to the tray; the tray icon brings it back.
+        Button::Copy => {
+            let (url, ok) = UI.with_borrow(|ui| {
+                // The exact track when the like lookup knows it, else a Spotify search for it.
+                if ui.like_id.is_empty() {
+                    let q = http::encode(&format!("{} {}", ui.title, ui.artist));
+                    (format!("https://open.spotify.com/search/{q}"), false)
+                } else {
+                    (format!("https://open.spotify.com/track/{}", ui.like_id), true)
+                }
+            });
+            let done = copy_text(hwnd, &url);
+            UI.with_borrow_mut(|ui| {
+                ui.notice = Some(match (done, ok) {
+                    (false, _) => "Couldn't copy",
+                    (true, true) => "Track link copied",
+                    (true, false) => "Search link copied (connect Spotify for the exact track)",
+                })
+            });
+            invalidate(hwnd);
+        }
         Button::Minimize => unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         },
@@ -889,6 +942,7 @@ impl Ui {
             Button::Shuffle => self.can_shuffle,
             Button::Repeat => self.can_repeat,
             Button::Mute | Button::Volume => self.volume >= 0,
+            Button::Copy => self.active && !self.title.is_empty(),
             Button::Like | Button::Lyrics | Button::Minimize | Button::Pin | Button::Close => true,
         }
     }
@@ -1128,6 +1182,18 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, stat
                 } else {
                     stroke(&[(cx + u * 0.55, cy - u * 0.5), (cx + u * 0.9, cy), (cx + u * 0.55, cy + u * 0.5)]);
                 }
+            }
+            Button::Copy => {
+                // Two overlapping sheets, the usual copy glyph.
+                let (a, d) = (u * 0.85, u * 0.45);
+                stroke(&[(cx - a + d, cy - a - d), (cx + a + d, cy - a - d), (cx + a + d, cy + a - d)]);
+                stroke(&[
+                    (cx - a - d, cy - a + d),
+                    (cx + a - d, cy - a + d),
+                    (cx + a - d, cy + a + d),
+                    (cx - a - d, cy + a + d),
+                    (cx - a - d, cy - a + d),
+                ]);
             }
             Button::Like => {
                 // Heart curve; filled when liked, outline otherwise.
@@ -1405,7 +1471,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         let right = s(width() - 12);
         SelectObject(hdc, title_font.into());
         SetTextColor(hdc, COLORREF(pal.title));
-        let mut r = RECT { left, top: s(26), right: right - s(LIKE_W), bottom: s(46) };
+        let mut r = RECT { left, top: s(26), right: right - s(2 * LIKE_W), bottom: s(46) };
         draw_text(hdc, title, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(hdc, artist_font.into());
         // A notice (sign-in progress, errors) replaces the artist line.
@@ -1456,6 +1522,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             Button::Repeat,
             Button::Mute,
             Button::Like,
+            Button::Copy,
             Button::Lyrics,
             Button::Minimize,
         ] {

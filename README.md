@@ -14,6 +14,7 @@ It does not play audio. Spotify keeps playing; the widget is a remote and a disp
 - Play/pause, previous, next, a progress bar you can click or drag to seek, and elapsed/total time.
 - Shuffle, repeat (off, list, track), mute, and a volume slider for Spotify's level.
 - A heart that saves the current track to your Liked Songs (needs a one-time setup, see below).
+- A copy button next to the heart that puts the song's Spotify link on the clipboard. With Spotify connected it is the exact track link; without, a Spotify search link for the song.
 - Synced lyrics in a translucent box, from [LRCLIB](https://lrclib.net). Plain lyrics scroll with the mouse wheel when there are no timestamps.
 - A slow, flowing gradient behind everything, colored from the album art. It only animates while a track plays.
 - Dark and light theme (follows Windows), accent color from the art, crisp at 100% to 200% display scaling.
