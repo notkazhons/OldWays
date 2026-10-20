@@ -58,18 +58,26 @@ Goal: make it look good without costing memory.
 - [x] High DPI aware, crisp at 100% to 200% scaling.
 - [x] Smooth hover feedback without a constant animation timer.
 
-## S8: Tray and behavior (todo)
+## S8: Tray and behavior (doing)
 Goal: stay out of the way.
 - [x] Tray icon with show/hide and quit (done in S3b).
-- [ ] Optional start with Windows.
-- [ ] Single instance only.
-- [ ] Hide to tray frees the album art bitmap.
+- [x] Optional start with Windows (tray menu checkbox, HKCU Run key).
+- [x] Single instance only.
+- [x] Hide to tray frees the album art bitmap.
 
 ## S9: Spotify Web API extras, optional (todo)
 Goal: controls SMTC cannot do. Requires Premium and a one-time login.
 - [ ] OAuth with PKCE, refresh token stored in Windows Credential Manager.
 - [ ] Volume, shuffle, repeat, like.
 - [ ] No extra network traffic or memory when the user has not logged in.
+
+## S11: Lyrics box (todo)
+Goal: a toggle shows a small box with the lyrics of the current track.
+- [ ] Source: LRCLIB (lrclib.net), free public API, no key. The request sends artist, title, album and duration to that server. Synced lines when available, plain text as fallback, a short message when nothing is found.
+- [ ] Fetch only while the box is open, on the worker thread, with WinHTTP (no extra crate). Keep the current track's lyrics only.
+- [ ] Toggle button on the controls row. The window grows to fit the box; the setting is remembered.
+- [ ] Synced lyrics highlight the current line and follow the playback position. Reuse the existing 1 Hz timer, nothing new when the box is closed.
+- [ ] Hide to tray or closing the box frees the lyrics text.
 
 ## S10: Efficiency pass and release (todo)
 Goal: measure and lock in the budget.

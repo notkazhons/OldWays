@@ -127,9 +127,18 @@ pub enum Command {
 enum Msg {
     Refresh,
     Command(Command),
+    /// The UI dropped the album art (window hidden); send it again.
+    ResendArt,
 }
 
 static CONTROL: OnceLock<Sender<Msg>> = OnceLock::new();
+
+/// Ask the worker to decode and post the current album art again.
+pub fn resend_art() {
+    if let Some(tx) = CONTROL.get() {
+        let _ = tx.send(Msg::ResendArt);
+    }
+}
 
 /// Ask the worker to run a playback command on Spotify.
 pub fn command(c: Command) {
@@ -251,18 +260,24 @@ struct Key {
     dur_ms: i64,
 }
 
-fn handle(manager: &Manager, msg: Msg) {
-    if let Msg::Command(c) = msg {
-        if let Ok(Some(session)) = find_spotify(manager) {
-            let op = match c {
-                Command::Toggle => session.TryTogglePlayPauseAsync(),
-                Command::Next => session.TrySkipNextAsync(),
-                Command::Prev => session.TrySkipPreviousAsync(),
-                Command::Seek(ms) => session.TryChangePlaybackPositionAsync(ms * TICKS_PER_MS),
-            };
-            let _ = op.and_then(|o| o.join());
+/// Runs a command. Returns true when the message asks for the art to be sent again.
+fn handle(manager: &Manager, msg: Msg) -> bool {
+    match msg {
+        Msg::Refresh => {}
+        Msg::ResendArt => return true,
+        Msg::Command(c) => {
+            if let Ok(Some(session)) = find_spotify(manager) {
+                let op = match c {
+                    Command::Toggle => session.TryTogglePlayPauseAsync(),
+                    Command::Next => session.TrySkipNextAsync(),
+                    Command::Prev => session.TrySkipPreviousAsync(),
+                    Command::Seek(ms) => session.TryChangePlaybackPositionAsync(ms * TICKS_PER_MS),
+                };
+                let _ = op.and_then(|o| o.join());
+            }
         }
     }
+    false
 }
 
 fn now_ticks() -> i64 {
@@ -373,12 +388,16 @@ fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
             post(window, msg, np);
         }
         // Block until the next SMTC event or command; no polling.
-        match rx.recv() {
+        let mut resend = match rx.recv() {
             Ok(m) => handle(&manager, m),
             Err(_) => return Ok(()),
-        }
+        };
         while let Ok(m) = rx.try_recv() {
-            handle(&manager, m);
+            resend |= handle(&manager, m);
+        }
+        if resend {
+            // Pretend the art is missing so the next snapshot decodes and posts it.
+            last.has_art = false;
         }
     }
 }

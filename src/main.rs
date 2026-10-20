@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::time::Instant;
 
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+    WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmGetColorizationColor, DwmSetWindowAttribute,
 };
@@ -33,7 +36,11 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+    RegSetKeyValueW,
+};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::core::{BOOL, PCWSTR, PWSTR, Result, w};
 
 /// Logical size in device-independent pixels at 96 DPI.
@@ -51,6 +58,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_NOWPLAYING: u32 = WM_APP + 2;
 const CMD_TOGGLE: usize = 1;
 const CMD_QUIT: usize = 2;
+const CMD_AUTOSTART: usize = 3;
+/// Posted by a second launch to make the running instance show itself.
+const WM_SHOW_REQUEST: u32 = WM_APP + 3;
 
 /// Whether the window stays above all other windows. Off, it is an ordinary window that sits
 /// behind apps but, being a tool window, stays visible after Win+D.
@@ -271,11 +281,51 @@ fn cursor() -> POINT {
     p
 }
 
+const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: PCWSTR = w!("MusicPlayerWidget");
+
+fn autostart_enabled() -> bool {
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None) }.is_ok()
+}
+
+fn set_autostart(on: bool) {
+    unsafe {
+        if on {
+            let Ok(exe) = std::env::current_exe() else { return };
+            let value: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain(Some(0)).collect();
+            let _ = RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                RUN_KEY,
+                RUN_VALUE,
+                REG_SZ.0,
+                Some(value.as_ptr() as *const _),
+                (value.len() * 2) as u32,
+            );
+        } else {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+        }
+    }
+}
+
+/// Ask Windows to take unused pages out of our working set.
+fn trim_memory() {
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
 fn tray_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let label = if IsWindowVisible(hwnd).as_bool() { w!("Hide") } else { w!("Show") };
+        let auto = autostart_enabled();
         let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE, label);
+        let _ = AppendMenuW(
+            menu,
+            if auto { MF_STRING | MF_CHECKED } else { MF_STRING },
+            CMD_AUTOSTART,
+            w!("Start with Windows"),
+        );
         let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit"));
         let p = cursor();
         // The menu only closes on an outside click if our window is foreground.
@@ -285,6 +335,7 @@ fn tray_menu(hwnd: HWND) {
         let _ = DestroyMenu(menu);
         match cmd.0 as usize {
             CMD_TOGGLE => toggle_visible(hwnd),
+            CMD_AUTOSTART => set_autostart(!auto),
             CMD_QUIT => {
                 let _ = DestroyWindow(hwnd);
             }
@@ -424,6 +475,8 @@ struct Ui {
     /// Position being dragged to, while the mouse is down on the progress bar.
     scrub: Option<i64>,
     timer_on: bool,
+    /// The album art bitmap was dropped because the window is hidden; ask for it on show.
+    art_freed: bool,
     /// Apps use the light theme.
     light: bool,
     /// Dominant vivid color of the current album art.
@@ -456,6 +509,7 @@ thread_local! {
             base_at: None,
             scrub: None,
             timer_on: false,
+            art_freed: false,
             light: false,
             accent: None,
             hover: None,
@@ -492,7 +546,16 @@ impl Ui {
         (self.base_ms + ahead).clamp(0, self.dur_ms.max(0))
     }
 
-    fn update(&mut self, np: media::NowPlaying) {
+    fn drop_art(&mut self) {
+        if let Some(old) = self.art.take() {
+            unsafe {
+                let _ = DeleteObject(old.into());
+            }
+        }
+    }
+
+    /// While hidden, new art is not turned into a bitmap; it is requested again on show.
+    fn update(&mut self, np: media::NowPlaying, visible: bool) {
         self.active = np.active;
         self.title = np.title;
         self.artist = np.artist;
@@ -511,14 +574,13 @@ impl Ui {
             media::ArtUpdate::Clear => None,
         };
         self.accent = new_art.as_ref().and_then(|a| a.accent);
-        if let Some(old) = self.art.take() {
-            unsafe {
-                let _ = DeleteObject(old.into());
-            }
+        self.drop_art();
+        self.art_freed = new_art.is_some() && !visible;
+        if visible {
+            self.art = new_art.map(|a| unsafe {
+                CreateBitmap(media::ART_SIZE, media::ART_SIZE, 1, 32, Some(a.bgra.as_ptr() as *const _))
+            });
         }
-        self.art = new_art.map(|a| unsafe {
-            CreateBitmap(media::ART_SIZE, media::ART_SIZE, 1, 32, Some(a.bgra.as_ptr() as *const _))
-        });
     }
 
     fn free_fonts(&mut self) {
@@ -1037,9 +1099,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_NOWPLAYING => {
             // Ownership of the box passes from the worker thread to us.
             let np = unsafe { Box::from_raw(lparam.0 as *mut media::NowPlaying) };
-            UI.with_borrow_mut(|ui| ui.update(*np));
-            sync_timer(hwnd, unsafe { IsWindowVisible(hwnd) }.as_bool());
+            let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            UI.with_borrow_mut(|ui| ui.update(*np, visible));
+            sync_timer(hwnd, visible);
             invalidate(hwnd);
+            LRESULT(0)
+        }
+        WM_SHOW_REQUEST => {
+            // A second launch asks the running instance to come forward.
+            unsafe {
+                if !IsWindowVisible(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
@@ -1064,7 +1136,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_SHOWWINDOW => {
-            sync_timer(hwnd, wparam.0 != 0);
+            let visible = wparam.0 != 0;
+            sync_timer(hwnd, visible);
+            if !visible {
+                // Hidden to the tray: drop the album art and give memory back to Windows.
+                UI.with_borrow_mut(|ui| {
+                    ui.art_freed = ui.art.is_some() || ui.art_freed;
+                    ui.drop_art();
+                });
+                trim_memory();
+            } else if UI.with_borrow_mut(|ui| std::mem::take(&mut ui.art_freed)) {
+                media::resend_art();
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_TRAY => {
@@ -1095,6 +1178,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 fn main() -> Result<()> {
     unsafe {
+        // One instance only: a second launch pokes the first one and exits.
+        let _single = CreateMutexW(None, true, w!("Local\\MusicPlayerWidgetSingleInstance"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(existing) = FindWindowW(w!("MusicPlayerWidget"), None) {
+                let _ = PostMessageW(Some(existing), WM_SHOW_REQUEST, WPARAM(0), LPARAM(0));
+            }
+            return Ok(());
+        }
+
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance = GetModuleHandleW(None)?;
         let class = w!("MusicPlayerWidget");
