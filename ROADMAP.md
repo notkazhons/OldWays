@@ -66,8 +66,8 @@ Goal: stay out of the way.
 - [x] Hide to tray frees the album art bitmap.
 
 ## S9: Shuffle, repeat, volume, like (doing)
-Goal: the extras the media session does not cover in the original plan. Spotify's audio level is reachable through the Windows volume mixer without a login. Shuffle, repeat and like are not: they need the Web API.
-- [ ] Shuffle and repeat buttons (built, greyed out). Spotify ignores shuffle and repeat commands sent through the Windows media session (tested: the call returns true, nothing changes), so they need the Web API.
+Goal: the extras the media session does not cover in the original plan. Spotify's audio level is reachable through the Windows volume mixer without a login. Shuffle and repeat go through the media session. Only like needs the Web API.
+- [x] Shuffle and repeat buttons through the media session, both directions (clicks in the widget change Spotify, changes in Spotify show in the widget). Repeat cycles off, list, track. An earlier test wrongly showed Spotify ignoring the commands.
 - [x] Speaker button mutes; slider sets Spotify's level in the Windows volume mixer (separate from the slider inside Spotify).
 - [ ] Like button (needs the Spotify Web API): OAuth with PKCE against a Spotify developer app (client id from the user), refresh token in Windows Credential Manager. Not started.
 - [ ] No extra network traffic or memory when the user has not logged in.

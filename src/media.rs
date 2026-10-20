@@ -338,10 +338,8 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
     let can_next = controls.IsNextEnabled()?;
     let can_toggle = controls.IsPlayEnabled()? || controls.IsPauseEnabled()?;
     let can_seek = controls.IsPlaybackPositionEnabled()?;
-    // Spotify advertises shuffle and repeat here and answers the commands with "true", but it
-    // never changes its state through the media session (tested). Keep the buttons disabled until
-    // they can go through the Spotify Web API instead.
-    let (can_shuffle, can_repeat) = (false, false);
+    let can_shuffle = controls.IsShuffleEnabled()?;
+    let can_repeat = controls.IsRepeatEnabled()?;
     let shuffle = info.IsShuffleActive().and_then(|v| v.Value()).unwrap_or(false);
     let repeat = match info.AutoRepeatMode().and_then(|v| v.Value()) {
         Ok(MediaPlaybackAutoRepeatMode::Track) => 1,
