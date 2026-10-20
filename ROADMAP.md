@@ -11,12 +11,12 @@ Goal: prove the Rust and MSVC toolchain builds a release binary.
 - [x] `cargo build --release` succeeds.
 - [x] Release profile tuned for size (`opt-level = "z"`, `lto`, `panic = "abort"`, `strip`).
 
-## S2: Read current track (doing)
+## S2: Read current track (done)
 Goal: read Spotify state through SMTC from a console binary, no UI yet.
 - [x] Find the Spotify session in `GlobalSystemMediaTransportControlsSessionManager`.
 - [x] Print title, artist, album, play state, position and duration.
-- [ ] Print a new line when the track or state changes (event driven, no polling loop).
-- [ ] Prints a clear message when Spotify is not running, and recovers when it starts.
+- [x] Print a new line when the track or state changes (event driven, no polling loop).
+- [x] Prints a clear message when Spotify is not running, and recovers when it starts.
 
 ## S3: Basic window (todo)
 Goal: a small borderless Win32 window with no content logic.
