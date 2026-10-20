@@ -81,7 +81,15 @@ Goal: a toggle shows a small box with the lyrics of the current track.
 
 ## S10: Efficiency pass and release (todo)
 Goal: measure and lock in the budget.
-- [ ] Measure working set and CPU idle, playing and paused. Record numbers in this file.
-- [ ] Fix anything over budget.
+- [x] Measure working set and CPU idle, playing and paused. Measured 2026-10-20 on the release build (Windows 11, Spotify playing a track, 483x140 window, flowing background on). CPU is the share of the whole machine, sampled over 10-15 s:
+
+  | State | CPU | Private working set | Working set |
+  |---|---|---|---|
+  | playing, visible | 0.05% | 5.0 MB | 31.7 MB |
+  | playing, hidden | 0.00% | 1.7 MB | 4.7 MB |
+  | paused, visible | 0.16% | 3.0 MB | 11.0 MB |
+  | paused, hidden | 0.04% | 2.2 MB | 6.3 MB |
+
+- [x] Fix anything over budget. Nothing is over: private working set stays under 15 MB playing and 10 MB idle. Paused CPU is not exactly 0 because Spotify's own events still wake the widget, but it is at noise level. The redraw timer (50 ms, for the flowing background) runs only while playing and visible.
 - [ ] Release build under 1 MB if reasonable, zipped to GitHub Releases.
 - [ ] README has install, usage and screenshots.

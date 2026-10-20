@@ -350,7 +350,7 @@ fn set_autostart(on: bool) {
     unsafe {
         if on {
             let Ok(exe) = std::env::current_exe() else { return };
-            let value: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain(Some(0)).collect();
+            let value: Vec<u16> = format!("\"{}\" --autostart", exe.display()).encode_utf16().chain(Some(0)).collect();
             let _ = RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 RUN_KEY,
