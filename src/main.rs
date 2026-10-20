@@ -1,14 +1,21 @@
 ﻿#![windows_subsystem = "windows"]
 
+mod media;
+
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateBitmap, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, DrawTextW, Ellipse, EndPaint, GetStockObject, InvalidateRect, NULL_BRUSH,
-    PAINTSTRUCT, PS_SOLID, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
+    CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+    DeleteObject, DrawTextW, Ellipse, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject,
+    HALFTONE, HBITMAP, HDC, HFONT, InvalidateRect, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    PS_SOLID, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
+    StretchBlt, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
@@ -26,9 +33,14 @@ const WIDTH: i32 = 320;
 const HEIGHT: i32 = 96;
 const MARGIN: i32 = 16;
 const CLOSE_SIZE: i32 = 28;
+/// Album art square and the padding around it.
+const ART: i32 = 80;
+const PAD: i32 = 8;
 
 /// Tray icon callback message and menu command ids.
 const WM_TRAY: u32 = WM_APP + 1;
+/// Posted by the media worker with a `Box<media::NowPlaying>` pointer in `lparam`.
+const WM_NOWPLAYING: u32 = WM_APP + 2;
 const CMD_TOGGLE: usize = 1;
 const CMD_QUIT: usize = 2;
 
@@ -273,6 +285,190 @@ fn tray_menu(hwnd: HWND) {
     }
 }
 
+/// What the window shows. Lives on the UI thread; the worker only posts updates.
+struct Ui {
+    active: bool,
+    title: String,
+    artist: String,
+    art: Option<HBITMAP>,
+    /// DPI the fonts were created for.
+    dpi: u32,
+    title_font: Option<HFONT>,
+    artist_font: Option<HFONT>,
+}
+
+thread_local! {
+    static UI: RefCell<Ui> = const {
+        RefCell::new(Ui {
+            active: false,
+            title: String::new(),
+            artist: String::new(),
+            art: None,
+            dpi: 0,
+            title_font: None,
+            artist_font: None,
+        })
+    };
+}
+
+impl Ui {
+    fn update(&mut self, np: media::NowPlaying) {
+        self.active = np.active;
+        self.title = np.title;
+        self.artist = np.artist;
+        // The previous bitmap is always replaced: a new track without art clears it.
+        if let Some(old) = self.art.take() {
+            unsafe {
+                let _ = DeleteObject(old.into());
+            }
+        }
+        self.art = np.art.map(|a| unsafe {
+            CreateBitmap(media::ART_SIZE, media::ART_SIZE, 1, 32, Some(a.bgra.as_ptr() as *const _))
+        });
+    }
+
+    fn free_fonts(&mut self) {
+        for f in [self.title_font.take(), self.artist_font.take()].into_iter().flatten() {
+            unsafe {
+                let _ = DeleteObject(f.into());
+            }
+        }
+    }
+
+    fn free(&mut self) {
+        self.free_fonts();
+        if let Some(b) = self.art.take() {
+            unsafe {
+                let _ = DeleteObject(b.into());
+            }
+        }
+    }
+
+    /// Fonts are rebuilt only when the DPI changes.
+    fn fonts(&mut self, hwnd: HWND) -> (HFONT, HFONT) {
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi != self.dpi || self.title_font.is_none() {
+            self.free_fonts();
+            self.dpi = dpi;
+            let make = |px: i32, weight: i32| unsafe {
+                CreateFontW(
+                    -scale(hwnd, px),
+                    0,
+                    0,
+                    0,
+                    weight,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY,
+                    0,
+                    w!("Segoe UI"),
+                )
+            };
+            self.title_font = Some(make(15, FW_SEMIBOLD.0 as i32));
+            self.artist_font = Some(make(13, FW_NORMAL.0 as i32));
+        }
+        (self.title_font.unwrap(), self.artist_font.unwrap())
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, flags: DRAW_TEXT_FORMAT) {
+    let mut buf = wide(s);
+    unsafe {
+        DrawTextW(hdc, &mut buf, rect, flags | DT_NOPREFIX | DT_SINGLELINE);
+    }
+}
+
+fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
+    UI.with_borrow_mut(|ui| unsafe {
+        let (title_font, artist_font) = ui.fonts(hwnd);
+        let s = |v| scale(hwnd, v);
+
+        let bg = CreateSolidBrush(COLORREF(0x00201C1A));
+        FillRect(hdc, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
+        let _ = DeleteObject(bg.into());
+        SetBkMode(hdc, TRANSPARENT);
+
+        // Album art, or a placeholder square.
+        let art = RECT { left: s(PAD), top: s(PAD), right: s(PAD + ART), bottom: s(PAD + ART) };
+        match ui.art {
+            Some(bmp) => {
+                let src = CreateCompatibleDC(Some(hdc));
+                let old = SelectObject(src, bmp.into());
+                SetStretchBltMode(hdc, HALFTONE);
+                let _ = StretchBlt(
+                    hdc,
+                    art.left,
+                    art.top,
+                    art.right - art.left,
+                    art.bottom - art.top,
+                    Some(src),
+                    0,
+                    0,
+                    media::ART_SIZE,
+                    media::ART_SIZE,
+                    SRCCOPY,
+                );
+                SelectObject(src, old);
+                let _ = DeleteDC(src);
+            }
+            None => {
+                let b = CreateSolidBrush(COLORREF(0x002E2A28));
+                FillRect(hdc, &art, b);
+                let _ = DeleteObject(b.into());
+                SelectObject(hdc, title_font.into());
+                SetTextColor(hdc, COLORREF(0x00707070));
+                let mut r = art;
+                draw_text(hdc, "\u{266A}", &mut r, DT_CENTER | DT_VCENTER);
+            }
+        }
+
+        // Title and artist.
+        let (title, artist) = if !ui.active {
+            ("Nothing playing", "Spotify is not running")
+        } else if ui.title.is_empty() {
+            ("Nothing playing", "")
+        } else {
+            (ui.title.as_str(), ui.artist.as_str())
+        };
+        let left = s(PAD + ART + 12);
+        let right = s(WIDTH - 12);
+        SelectObject(hdc, title_font.into());
+        SetTextColor(hdc, COLORREF(0x00F0F0F0));
+        let mut r = RECT { left, top: s(30), right, bottom: s(54) };
+        draw_text(hdc, title, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        SelectObject(hdc, artist_font.into());
+        SetTextColor(hdc, COLORREF(0x00A0A0A0));
+        let mut r = RECT { left, top: s(54), right, bottom: s(76) };
+        draw_text(hdc, artist, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        // Buttons: close (x) and pin ring.
+        SelectObject(hdc, title_font.into());
+        SetTextColor(hdc, COLORREF(0x00D0D0D0));
+        let mut r = close_rect(hwnd);
+        draw_text(hdc, "\u{D7}", &mut r, DT_CENTER | DT_VCENTER);
+
+        let on = TOPMOST.load(Ordering::Relaxed);
+        let color = COLORREF(if on { 0x00D0D0D0 } else { 0x00707070 });
+        let pen = CreatePen(PS_SOLID, s(2), color);
+        let old_pen = SelectObject(hdc, pen.into());
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let (p, d) = (pin_rect(hwnd), s(10));
+        let (cx, cy) = ((p.left + p.right) / 2, (p.top + p.bottom) / 2);
+        let _ = Ellipse(hdc, cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(pen.into());
+    });
+}
+
 fn client_point(lparam: LPARAM) -> POINT {
     POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 }
 }
@@ -324,24 +520,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             unsafe {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, COLORREF(0x00D0D0D0));
-                let mut x: [u16; 1] = [0x00D7];
-                let mut r = close_rect(hwnd);
-                DrawTextW(hdc, &mut x, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-                let on = TOPMOST.load(Ordering::Relaxed);
-                let color = COLORREF(if on { 0x00D0D0D0 } else { 0x00707070 });
-                let pen = CreatePen(PS_SOLID, scale(hwnd, 2), color);
-                let old_pen = SelectObject(hdc, pen.into());
-                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                let (p, d) = (pin_rect(hwnd), scale(hwnd, 10));
-                let (cx, cy) = ((p.left + p.right) / 2, (p.top + p.bottom) / 2);
-                let _ = Ellipse(hdc, cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2);
-                SelectObject(hdc, old_pen);
-                SelectObject(hdc, old_brush);
-                let _ = DeleteObject(pen.into());
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let (w, h) = (rc.right, rc.bottom);
+                // Draw off-screen and copy once, so updates do not flicker.
+                let mem = CreateCompatibleDC(Some(hdc));
+                let bmp = CreateCompatibleBitmap(hdc, w, h);
+                let old = SelectObject(mem, bmp.into());
+                draw(hwnd, mem, w, h);
+                let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+                SelectObject(mem, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(mem);
                 let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NOWPLAYING => {
+            // Ownership of the box passes from the worker thread to us.
+            let np = unsafe { Box::from_raw(lparam.0 as *mut media::NowPlaying) };
+            UI.with_borrow_mut(|ui| ui.update(*np));
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -356,6 +557,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_DESTROY => {
             save_state(hwnd);
             remove_tray(hwnd);
+            UI.with_borrow_mut(|ui| ui.free());
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -423,6 +625,7 @@ fn main() -> Result<()> {
         );
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        media::spawn(hwnd, WM_NOWPLAYING);
 
         // Blocks until a message arrives: no timers, no polling.
         let mut msg = MSG::default();
