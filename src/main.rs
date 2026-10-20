@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::time::Instant;
 
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmGetColorizationColor, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
@@ -31,7 +33,8 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PWSTR, Result, w};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::core::{BOOL, PCWSTR, PWSTR, Result, w};
 
 /// Logical size in device-independent pixels at 96 DPI.
 const WIDTH: i32 = 320;
@@ -384,6 +387,8 @@ fn activate(hwnd: HWND, b: Button) {
 }
 
 const TIMER_ID: usize = 1;
+/// Sent when the system accent color changes (not exposed by the bindings).
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 
 /// The once-a-second redraw runs only while a track plays and the window is visible.
 fn sync_timer(hwnd: HWND, visible: bool) {
@@ -419,6 +424,10 @@ struct Ui {
     /// Position being dragged to, while the mouse is down on the progress bar.
     scrub: Option<i64>,
     timer_on: bool,
+    /// Apps use the light theme.
+    light: bool,
+    /// Dominant vivid color of the current album art.
+    accent: Option<(u8, u8, u8)>,
     hover: Option<Button>,
     pressed: Option<Button>,
     /// A WM_MOUSELEAVE request is outstanding.
@@ -447,6 +456,8 @@ thread_local! {
             base_at: None,
             scrub: None,
             timer_on: false,
+            light: false,
+            accent: None,
             hover: None,
             pressed: None,
             tracking: false,
@@ -499,6 +510,7 @@ impl Ui {
             media::ArtUpdate::Set(a) => Some(a),
             media::ArtUpdate::Clear => None,
         };
+        self.accent = new_art.as_ref().and_then(|a| a.accent);
         if let Some(old) = self.art.take() {
             unsafe {
                 let _ = DeleteObject(old.into());
@@ -611,6 +623,107 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, play
     }
 }
 
+/// Colors as 0x00BBGGRR. The window follows the system "apps" light/dark setting.
+struct Palette {
+    bg: u32,
+    art_bg: u32,
+    art_note: u32,
+    title: u32,
+    artist: u32,
+    time: u32,
+    track: u32,
+    thumb: u32,
+    hot_bg: u32,
+    pressed_bg: u32,
+    icon: u32,
+    icon_hot: u32,
+    icon_off: u32,
+    pin_on: u32,
+    pin_off: u32,
+}
+
+const DARK: Palette = Palette {
+    bg: 0x00201C1A,
+    art_bg: 0x002E2A28,
+    art_note: 0x00707070,
+    title: 0x00F0F0F0,
+    artist: 0x00A0A0A0,
+    time: 0x00909090,
+    track: 0x004A4540,
+    thumb: 0x00FFFFFF,
+    hot_bg: 0x00383330,
+    pressed_bg: 0x00504A46,
+    icon: 0x00D0D0D0,
+    icon_hot: 0x00FFFFFF,
+    icon_off: 0x00505050,
+    pin_on: 0x00D0D0D0,
+    pin_off: 0x00707070,
+};
+
+const LIGHT: Palette = Palette {
+    bg: 0x00F4F4F4,
+    art_bg: 0x00DCDCDC,
+    art_note: 0x00909090,
+    title: 0x00202020,
+    artist: 0x005A5A5A,
+    time: 0x00707070,
+    track: 0x00D0D0D0,
+    thumb: 0x00202020,
+    hot_bg: 0x00E0E0E0,
+    pressed_bg: 0x00CFCFCF,
+    icon: 0x00303030,
+    icon_hot: 0x00000000,
+    icon_off: 0x00B0B0B0,
+    pin_on: 0x00303030,
+    pin_off: 0x00A0A0A0,
+};
+
+fn palette(light: bool) -> &'static Palette {
+    if light { &LIGHT } else { &DARK }
+}
+
+fn read_light_theme() -> bool {
+    let mut data = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    r.is_ok() && data != 0
+}
+
+/// System accent color, used when the album art gives none.
+fn system_accent() -> (u8, u8, u8) {
+    let (mut argb, mut opaque) = (0u32, BOOL(0));
+    if unsafe { DwmGetColorizationColor(&mut argb, &mut opaque) }.is_ok() {
+        ((argb >> 16) as u8, (argb >> 8) as u8, argb as u8)
+    } else {
+        (0x1D, 0xB9, 0x54)
+    }
+}
+
+/// Nudge a color until it reads against the background: lighter on dark, darker on light.
+fn readable(rgb: (u8, u8, u8), light: bool) -> u32 {
+    let lum = |c: (f32, f32, f32)| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
+    let mut c = (rgb.0 as f32, rgb.1 as f32, rgb.2 as f32);
+    for _ in 0..8 {
+        let l = lum(c);
+        let (target, ok) = if light { (0.0, l < 150.0) } else { (255.0, l > 110.0) };
+        if ok {
+            break;
+        }
+        c = (c.0 + (target - c.0) * 0.15, c.1 + (target - c.1) * 0.15, c.2 + (target - c.2) * 0.15);
+    }
+    (c.0 as u32) | ((c.1 as u32) << 8) | ((c.2 as u32) << 16)
+}
+
 /// Rounded rectangle in a solid color, no outline.
 fn fill_round(hdc: HDC, l: i32, t: i32, r: i32, b: i32, radius: i32, color: u32) {
     unsafe {
@@ -643,8 +756,10 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
     UI.with_borrow_mut(|ui| unsafe {
         let (title_font, artist_font, time_font) = ui.fonts(hwnd);
         let s = |v| scale(hwnd, v);
+        let pal = palette(ui.light);
+        let accent = readable(ui.accent.unwrap_or_else(system_accent), ui.light);
 
-        let bg = CreateSolidBrush(COLORREF(0x00201C1A));
+        let bg = CreateSolidBrush(COLORREF(pal.bg));
         FillRect(hdc, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
         let _ = DeleteObject(bg.into());
         SetBkMode(hdc, TRANSPARENT);
@@ -673,11 +788,11 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
                 let _ = DeleteDC(src);
             }
             None => {
-                let b = CreateSolidBrush(COLORREF(0x002E2A28));
+                let b = CreateSolidBrush(COLORREF(pal.art_bg));
                 FillRect(hdc, &art, b);
                 let _ = DeleteObject(b.into());
                 SelectObject(hdc, title_font.into());
-                SetTextColor(hdc, COLORREF(0x00707070));
+                SetTextColor(hdc, COLORREF(pal.art_note));
                 let mut r = art;
                 draw_text(hdc, "\u{266A}", &mut r, DT_CENTER | DT_VCENTER);
             }
@@ -694,11 +809,11 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         let left = s(TEXT_X);
         let right = s(WIDTH - 12);
         SelectObject(hdc, title_font.into());
-        SetTextColor(hdc, COLORREF(0x00F0F0F0));
+        SetTextColor(hdc, COLORREF(pal.title));
         let mut r = RECT { left, top: s(26), right, bottom: s(46) };
         draw_text(hdc, title, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(hdc, artist_font.into());
-        SetTextColor(hdc, COLORREF(0x00A0A0A0));
+        SetTextColor(hdc, COLORREF(pal.artist));
         let mut r = RECT { left, top: s(46), right, bottom: s(64) };
         draw_text(hdc, artist, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
@@ -713,19 +828,19 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             let th = s(if hot { 6 } else { 4 });
             let cy = (bar.top + bar.bottom) / 2;
             let (y0, y1) = (cy - th / 2, cy - th / 2 + th);
-            fill_round(hdc, bar.left, y0, bar.right, y1, th, 0x004A4540);
+            fill_round(hdc, bar.left, y0, bar.right, y1, th, pal.track);
             if filled > 0 {
-                let color = if can { 0x00D0D0D0 } else { 0x00707070 };
+                let color = if can { accent } else { pal.icon_off };
                 fill_round(hdc, bar.left, y0, bar.left + filled.max(th), y1, th, color);
             }
             if hot {
                 let d = s(12);
                 let x = bar.left + filled;
-                fill_round(hdc, x - d / 2, cy - d / 2, x + d / 2, cy + d / 2, d, 0x00FFFFFF);
+                fill_round(hdc, x - d / 2, cy - d / 2, x + d / 2, cy + d / 2, d, pal.thumb);
             }
 
             SelectObject(hdc, time_font.into());
-            SetTextColor(hdc, COLORREF(0x00909090));
+            SetTextColor(hdc, COLORREF(pal.time));
             let mut r = RECT { left: s(TEXT_X), top: bar.top, right: s(TEXT_X + TIME_W), bottom: bar.bottom };
             draw_text(hdc, &fmt_time(pos), &mut r, DT_RIGHT | DT_VCENTER);
             let mut r = RECT { left: bar.right + s(4), top: bar.top, right: s(WIDTH - 8), bottom: bar.bottom };
@@ -739,7 +854,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             let down = ui.pressed == Some(b);
             let hot = enabled && (down || ui.hover == Some(b));
             if hot {
-                let bg = CreateSolidBrush(COLORREF(if down { 0x00504A46 } else { 0x00383330 }));
+                let bg = CreateSolidBrush(COLORREF(if down { pal.pressed_bg } else { pal.hot_bg }));
                 let old_brush = SelectObject(hdc, bg.into());
                 let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
                 let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, s(8), s(8));
@@ -747,18 +862,18 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
                 SelectObject(hdc, old_brush);
                 let _ = DeleteObject(bg.into());
             }
-            let color = if !enabled { 0x00505050 } else if hot { 0x00FFFFFF } else { 0x00D0D0D0 };
+            let color = if !enabled { pal.icon_off } else if hot { pal.icon_hot } else { pal.icon };
             draw_icon(hwnd, hdc, b, &rect, COLORREF(color), ui.playing);
         }
 
         // Buttons: close (x) and pin ring.
         SelectObject(hdc, title_font.into());
-        SetTextColor(hdc, COLORREF(0x00D0D0D0));
+        SetTextColor(hdc, COLORREF(pal.icon));
         let mut r = close_rect(hwnd);
         draw_text(hdc, "\u{D7}", &mut r, DT_CENTER | DT_VCENTER);
 
         let on = TOPMOST.load(Ordering::Relaxed);
-        let color = COLORREF(if on { 0x00D0D0D0 } else { 0x00707070 });
+        let color = COLORREF(if on { pal.pin_on } else { pal.pin_off });
         let pen = CreatePen(PS_SOLID, s(2), color);
         let old_pen = SelectObject(hdc, pen.into());
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -927,6 +1042,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             invalidate(hwnd);
             LRESULT(0)
         }
+        WM_SETTINGCHANGE => {
+            // lparam names the setting; "ImmersiveColorSet" is the light/dark/accent change.
+            if lparam.0 != 0 {
+                let name = unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default();
+                if name == "ImmersiveColorSet" {
+                    UI.with_borrow_mut(|ui| ui.light = read_light_theme());
+                    invalidate(hwnd);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            invalidate(hwnd);
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == TIMER_ID {
                 invalidate(hwnd);
@@ -973,7 +1103,7 @@ fn main() -> Result<()> {
             hInstance: instance.into(),
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: CreateSolidBrush(COLORREF(0x00201C1A)),
+            hbrBackground: CreateSolidBrush(COLORREF(palette(read_light_theme()).bg)),
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -1015,6 +1145,7 @@ fn main() -> Result<()> {
             size_of_val(&round) as u32,
         );
 
+        UI.with_borrow_mut(|ui| ui.light = read_light_theme());
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         media::spawn(hwnd, WM_NOWPLAYING);
 

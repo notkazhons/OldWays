@@ -51,12 +51,12 @@ Goal: show and change position.
 - [x] Click or drag on the bar seeks.
 - [x] Timer fully stops on pause, minimize or hide.
 
-## S7: Look and feel (todo)
+## S7: Look and feel (done)
 Goal: make it look good without costing memory.
-- [ ] Dark and light theme follows the system setting.
-- [ ] Accent color from album art or system accent.
-- [ ] High DPI aware, crisp at 100% to 200% scaling.
-- [ ] Smooth hover feedback without a constant animation timer.
+- [x] Dark and light theme follows the system setting.
+- [x] Accent color from album art or system accent.
+- [x] High DPI aware, crisp at 100% to 200% scaling.
+- [x] Smooth hover feedback without a constant animation timer.
 
 ## S8: Tray and behavior (todo)
 Goal: stay out of the way.

@@ -34,6 +34,41 @@ const JUMP_MS: i64 = 1500;
 pub struct Art {
     /// `ART_SIZE` x `ART_SIZE`, 32 bits per pixel, BGRA.
     pub bgra: Vec<u8>,
+    /// Dominant vivid color (r, g, b), if the art has one.
+    pub accent: Option<(u8, u8, u8)>,
+}
+
+/// Most common vivid hue in the art: weight pixels by saturation, bucket by hue (12 buckets of
+/// 30 degrees), and average the heaviest bucket. Greys and near-black/white pixels are ignored.
+fn accent_of(bgra: &[u8]) -> Option<(u8, u8, u8)> {
+    // Per bucket: total weight and weighted sums of r, g, b.
+    let mut buckets = [(0f32, 0f32, 0f32, 0f32); 12];
+    for px in bgra.chunks_exact(4) {
+        let (b, g, r) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let (sat, val) = if max > 0.0 { ((max - min) / max, max / 255.0) } else { (0.0, 0.0) };
+        if sat < 0.35 || !(0.25..=0.97).contains(&val) {
+            continue;
+        }
+        let d = max - min;
+        let hue = if max == r {
+            ((g - b) / d).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        } * 60.0;
+        let w = sat * (1.0 - (val - 0.65).abs());
+        let k = ((hue / 30.0) as usize).min(11);
+        let e = &mut buckets[k];
+        *e = (e.0 + w, e.1 + r * w, e.2 + g * w, e.3 + b * w);
+    }
+    let best = buckets.iter().max_by(|a, b| a.0.total_cmp(&b.0))?;
+    // Needs a few percent of the image in one hue, or the art is effectively grey.
+    if best.0 < (bgra.len() / 4) as f32 * 0.02 {
+        return None;
+    }
+    Some(((best.1 / best.0) as u8, (best.2 / best.0) as u8, (best.3 / best.0) as u8))
 }
 
 /// What to do with the bitmap the UI already holds.
@@ -170,7 +205,11 @@ fn load_art(props: &Props) -> Option<Art> {
         .join()
         .ok()?;
     let bgra = data.DetachPixelData().ok()?.to_vec();
-    (bgra.len() == (ART_SIZE * ART_SIZE * 4) as usize).then_some(Art { bgra })
+    if bgra.len() != (ART_SIZE * ART_SIZE * 4) as usize {
+        return None;
+    }
+    let accent = accent_of(&bgra);
+    Some(Art { bgra, accent })
 }
 
 fn post(window: isize, msg: u32, np: NowPlaying) {
