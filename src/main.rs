@@ -1,5 +1,6 @@
 ﻿#![windows_subsystem = "windows"]
 
+mod flow;
 mod http;
 mod lyrics;
 mod media;
@@ -8,7 +9,7 @@ mod volume;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::time::Instant;
 
 use windows::Win32::Foundation::{
@@ -19,7 +20,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmGetColorizationColor, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, DIB_RGB_COLORS, StretchDIBits, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
     DeleteObject, DrawTextW, Ellipse, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject,
@@ -48,9 +49,14 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::core::{BOOL, PCWSTR, PWSTR, Result, w};
 
-/// Logical size in device-independent pixels at 96 DPI.
-const WIDTH: i32 = 360;
+/// Logical size in device-independent pixels at 96 DPI. The width is changed by dragging the
+/// left or right edge and saved with the window position.
+const DEFAULT_WIDTH: i32 = 360;
+const MIN_WIDTH: i32 = 340;
+const MAX_WIDTH: i32 = 900;
 const HEIGHT: i32 = 112;
+/// Width of the grab zone at each side edge.
+const EDGE: i32 = 6;
 /// Extra height while the lyrics box is open.
 const LYRICS_H: i32 = 100;
 const LYRIC_LINES: i32 = 4;
@@ -79,8 +85,13 @@ const WM_LYRICS: u32 = WM_APP + 4;
 /// Whether the window stays above all other windows. Off, it is an ordinary window that sits
 /// behind apps but, being a tool window, stays visible after Win+D.
 static TOPMOST: AtomicBool = AtomicBool::new(true);
+static WIDTH_LP: AtomicI32 = AtomicI32::new(DEFAULT_WIDTH);
 static TIP: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+fn width() -> i32 {
+    WIDTH_LP.load(Ordering::Relaxed)
+}
 
 fn scale(hwnd: HWND, v: i32) -> i32 {
     let dpi = unsafe { GetDpiForWindow(hwnd) } as i32;
@@ -88,7 +99,7 @@ fn scale(hwnd: HWND, v: i32) -> i32 {
 }
 
 fn close_rect(hwnd: HWND) -> RECT {
-    let (w, s) = (scale(hwnd, WIDTH), scale(hwnd, CLOSE_SIZE));
+    let (w, s) = (scale(hwnd, width()), scale(hwnd, CLOSE_SIZE));
     RECT { left: w - s, top: 0, right: w, bottom: s }
 }
 
@@ -96,6 +107,40 @@ fn close_rect(hwnd: HWND) -> RECT {
 fn pin_rect(hwnd: HWND) -> RECT {
     let c = close_rect(hwnd);
     RECT { left: c.left - (c.right - c.left), top: c.top, right: c.left, bottom: c.bottom }
+}
+
+/// Which side edge (true = left) the client point is on, for resizing.
+fn edge_at(hwnd: HWND, p: POINT) -> Option<bool> {
+    let (w, e) = (scale(hwnd, width()), scale(hwnd, EDGE));
+    if p.x < e {
+        Some(true)
+    } else if p.x >= w - e {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Resize while an edge is dragged: the opposite edge (`anchor`, screen x) stays put.
+fn drag_width(hwnd: HWND, left: bool, anchor: i32) {
+    unsafe {
+        let mut c = POINT::default();
+        let _ = GetCursorPos(&mut c);
+        let dpi = (GetDpiForWindow(hwnd) as i32).max(96);
+        let phys = if left { anchor - c.x } else { c.x - anchor };
+        let lw = (phys * 96 / dpi).clamp(MIN_WIDTH, MAX_WIDTH);
+        if lw == width() {
+            return;
+        }
+        WIDTH_LP.store(lw, Ordering::Relaxed);
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        let pw = scale(hwnd, lw);
+        let x = if left { anchor - pw } else { r.left };
+        let _ = SetWindowPos(hwnd, None, x, r.top, pw, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    update_tip(hwnd);
+    invalidate(hwnd);
 }
 
 fn in_rect(r: &RECT, p: POINT) -> bool {
@@ -107,15 +152,22 @@ fn state_path() -> Option<PathBuf> {
     Some(dir.join("window.txt"))
 }
 
-/// Saved position, topmost flag and lyrics-box flag, if the file exists and the spot is still on screen.
-fn load_state() -> Option<(i32, i32, bool, bool)> {
+/// Saved position, topmost flag, lyrics-box flag and width, if the file exists and the spot is still on screen.
+fn load_state() -> Option<(i32, i32, bool, bool, i32)> {
     let text = std::fs::read_to_string(state_path()?).ok()?;
     let mut it = text.split_whitespace();
     let x: i32 = it.next()?.parse().ok()?;
     let y: i32 = it.next()?.parse().ok()?;
     // Older files wrote "1"/"0" or a mode name ("desktop" no longer exists and reads as off).
     let topmost = matches!(it.next()?, "1" | "top");
-    let lyrics = it.next() == Some("lyrics");
+    let (mut lyrics, mut w) = (false, DEFAULT_WIDTH);
+    for tok in it {
+        if tok == "lyrics" {
+            lyrics = true;
+        } else if let Some(n) = tok.strip_prefix('w').and_then(|n| n.parse::<i32>().ok()) {
+            w = n.clamp(MIN_WIDTH, MAX_WIDTH);
+        }
+    }
     let (vx, vy, vw, vh) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -125,7 +177,7 @@ fn load_state() -> Option<(i32, i32, bool, bool)> {
         )
     };
     let visible = x >= vx - 40 && y >= vy && x < vx + vw - 40 && y < vy + vh - 40;
-    visible.then_some((x, y, topmost, lyrics))
+    visible.then_some((x, y, topmost, lyrics, w))
 }
 
 fn save_state(hwnd: HWND) {
@@ -139,7 +191,7 @@ fn save_state(hwnd: HWND) {
     }
     let top = if TOPMOST.load(Ordering::Relaxed) { "top" } else { "normal" };
     let lyrics = if UI.with_borrow(|ui| ui.lyrics_open) { " lyrics" } else { "" };
-    let _ = std::fs::write(path, format!("{} {} {}{}", r.left, r.top, top, lyrics));
+    let _ = std::fs::write(path, format!("{} {} {}{} w{}", r.left, r.top, top, lyrics, width()));
 }
 
 fn default_position(w: i32, h: i32) -> (i32, i32) {
@@ -230,29 +282,19 @@ fn create_tip(hwnd: HWND, instance: HINSTANCE) -> Result<()> {
     Ok(())
 }
 
-/// 32x32 green play triangle, built in memory so the exe needs no icon resource.
-fn make_icon() -> Result<HICON> {
-    const N: usize = 32;
-    let mut px = [0u32; N * N];
-    for y in 0..N {
-        for x in 0..N {
-            // Triangle with vertices (8,5), (8,26), (26,15.5).
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let half = (26.0 - fx) / 18.0 * 10.5;
-            if (8.0..=26.0).contains(&fx) && (fy - 15.5).abs() <= half {
-                px[y * N + x] = 0xFF1DB954;
-            }
-        }
-    }
-    unsafe {
-        let color = CreateBitmap(N as i32, N as i32, 1, 32, Some(px.as_ptr() as *const _));
-        let mask = CreateBitmap(N as i32, N as i32, 1, 1, None);
-        let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-        let icon = CreateIconIndirect(&info);
-        let _ = DeleteObject(color.into());
-        let _ = DeleteObject(mask.into());
-        icon
-    }
+/// The cassette icon, embedded as a multi-size .ico whose images are PNG-compressed.
+static ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
+
+/// Build an icon from the embedded .ico entry of `size` x `size` pixels.
+fn make_icon(size: i32) -> Result<HICON> {
+    let le16 = |o: usize| u16::from_le_bytes([ICON_ICO[o], ICON_ICO[o + 1]]) as usize;
+    let le32 = |o: usize| u32::from_le_bytes(ICON_ICO[o..o + 4].try_into().unwrap()) as usize;
+    let entry = (0..le16(4))
+        .map(|i| 6 + i * 16)
+        .find(|&e| ICON_ICO[e] as i32 == size % 256)
+        .ok_or_else(windows::core::Error::empty)?;
+    let (len, off) = (le32(entry + 8), le32(entry + 12));
+    unsafe { CreateIconFromResourceEx(&ICON_ICO[off..off + len], true, 0x0003_0000, size, size, LR_DEFAULTCOLOR) }
 }
 
 fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -392,6 +434,7 @@ enum Button {
     Volume,
     Seek,
     Lyrics,
+    Minimize,
     Pin,
     Close,
 }
@@ -403,6 +446,7 @@ const CTRL_LEFT: i32 = TEXT_X;
 const CTRL_TOP: i32 = 84;
 const CTRL_W: i32 = 28;
 const CTRL_H: i32 = 24;
+const LIKE_W: i32 = 24;
 const BAR_TOP: i32 = 64;
 const BAR_H: i32 = 20;
 /// Width reserved for each time label beside the progress bar.
@@ -413,7 +457,7 @@ fn bar_rect(hwnd: HWND) -> RECT {
     RECT {
         left: scale(hwnd, TEXT_X + TIME_W + 4),
         top: scale(hwnd, BAR_TOP),
-        right: scale(hwnd, WIDTH - 12 - TIME_W - 4),
+        right: scale(hwnd, width() - 12 - TIME_W - 4),
         bottom: scale(hwnd, BAR_TOP + BAR_H),
     }
 }
@@ -447,6 +491,12 @@ fn button_rect(hwnd: HWND, b: Button) -> RECT {
         right: scale(hwnd, r),
         bottom: scale(hwnd, CTRL_TOP + CTRL_H),
     };
+    let row_at = |top: i32, l: i32, r: i32, h: i32| RECT {
+        left: scale(hwnd, l),
+        top: scale(hwnd, top),
+        right: scale(hwnd, r),
+        bottom: scale(hwnd, top + h),
+    };
     let after_ctrls = CTRL_LEFT + 5 * CTRL_W + 8;
     match b {
         Button::Shuffle => ctrl(0),
@@ -455,13 +505,15 @@ fn button_rect(hwnd: HWND, b: Button) -> RECT {
         Button::Next => ctrl(3),
         Button::Repeat => ctrl(4),
         Button::Mute => row(after_ctrls, after_ctrls + 24),
-        Button::Volume => row(after_ctrls + 28, WIDTH - 12),
+        Button::Volume => row(after_ctrls + 28, width() - 12),
         Button::Seek => bar_rect(hwnd),
-        // Top-right group, left of the pin: lyrics, then the heart.
-        Button::Lyrics | Button::Like => {
+        // Heart at the right end of the title row.
+        Button::Like => row_at(26, width() - 12 - LIKE_W, width() - 12, 20),
+        // Top-right group, left of the pin: minimize, then lyrics.
+        Button::Minimize | Button::Lyrics => {
             let p = pin_rect(hwnd);
             let w = p.right - p.left;
-            let slot = if b == Button::Lyrics { 1 } else { 2 };
+            let slot = if b == Button::Minimize { 1 } else { 2 };
             RECT { left: p.left - slot * w, top: p.top, right: p.left - (slot - 1) * w, bottom: p.bottom }
         }
         Button::Pin => pin_rect(hwnd),
@@ -481,6 +533,7 @@ fn button_at(hwnd: HWND, p: POINT) -> Option<Button> {
         Button::Seek,
         Button::Like,
         Button::Lyrics,
+        Button::Minimize,
         Button::Pin,
         Button::Close,
     ]
@@ -518,6 +571,10 @@ fn activate(hwnd: HWND, b: Button) {
     match b {
         Button::Close => unsafe {
             let _ = DestroyWindow(hwnd);
+        },
+        // No taskbar entry, so minimize hides to the tray; the tray icon brings it back.
+        Button::Minimize => unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
         },
         Button::Pin => {
             set_topmost(hwnd, !TOPMOST.load(Ordering::Relaxed));
@@ -626,7 +683,7 @@ fn resize(hwnd: HWND) {
     unsafe {
         let mut r = RECT::default();
         let _ = GetWindowRect(hwnd, &mut r);
-        let (w, h) = (scale(hwnd, WIDTH), scale(hwnd, window_height()));
+        let (w, h) = (scale(hwnd, width()), scale(hwnd, window_height()));
         let mut y = r.top;
         let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
@@ -672,13 +729,16 @@ const TIMER_ID: usize = 1;
 /// Sent when the system accent color changes (not exposed by the bindings).
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 
-/// The once-a-second redraw runs only while a track plays and the window is visible.
+/// Redraw interval for the flowing background and the progress bar.
+const FRAME_MS: u32 = 50;
+
+/// The redraw timer runs only while a track plays and the window is visible.
 fn sync_timer(hwnd: HWND, visible: bool) {
     UI.with_borrow_mut(|ui| {
-        let want = visible && ui.playing && ui.dur_ms > 0;
+        let want = visible && ui.playing;
         unsafe {
             if want && !ui.timer_on {
-                SetTimer(Some(hwnd), TIMER_ID, 1000, None);
+                SetTimer(Some(hwnd), TIMER_ID, FRAME_MS, None);
                 ui.timer_on = true;
             } else if !want && ui.timer_on {
                 let _ = KillTimer(Some(hwnd), TIMER_ID);
@@ -718,6 +778,16 @@ struct Ui {
     /// First visible line of plain lyrics.
     lyric_scroll: i32,
     art: Option<HBITMAP>,
+    /// The art's three main colors, for the flowing background.
+    palette: Option<[(u8, u8, u8); 3]>,
+    /// Colors currently drawn; eases toward `palette` on a track change.
+    flow_cur: Option<[flow::Rgb; 3]>,
+    /// Seconds of flow so far; only advances while playing.
+    flow_t: f32,
+    flow_last: Option<Instant>,
+    flow_buf: Vec<u32>,
+    /// Edge being dragged to resize: (left edge?, screen x of the opposite edge).
+    edge_drag: Option<(bool, i32)>,
     playing: bool,
     can_prev: bool,
     can_next: bool,
@@ -772,6 +842,12 @@ thread_local! {
             lyrics_key: String::new(),
             lyric_scroll: 0,
             art: None,
+            palette: None,
+            flow_cur: None,
+            flow_t: 0.0,
+            flow_last: None,
+            flow_buf: Vec::new(),
+            edge_drag: None,
             playing: false,
             can_prev: false,
             can_next: false,
@@ -812,7 +888,7 @@ impl Ui {
             Button::Shuffle => self.can_shuffle,
             Button::Repeat => self.can_repeat,
             Button::Mute | Button::Volume => self.volume >= 0,
-            Button::Like | Button::Lyrics | Button::Pin | Button::Close => true,
+            Button::Like | Button::Lyrics | Button::Minimize | Button::Pin | Button::Close => true,
         }
     }
 
@@ -866,12 +942,74 @@ impl Ui {
             media::ArtUpdate::Clear => None,
         };
         self.accent = new_art.as_ref().and_then(|a| a.accent);
+        self.palette = new_art.as_ref().map(|a| a.palette);
         self.drop_art();
         self.art_freed = new_art.is_some() && !visible;
         if visible {
             self.art = new_art.map(|a| unsafe {
                 CreateBitmap(media::ART_SIZE, media::ART_SIZE, 1, 32, Some(a.bgra.as_ptr() as *const _))
             });
+        }
+    }
+
+    /// Flowing color behind everything, tinted by the art. Frozen while paused.
+    fn draw_flow(&mut self, hdc: HDC, w: i32, h: i32, pal: &Palette) {
+        let now = Instant::now();
+        let dt = self.flow_last.map_or(0.0, |t| now.duration_since(t).as_secs_f32()).min(0.2);
+        self.flow_last = Some(now);
+        if self.playing {
+            self.flow_t += dt;
+        }
+        let rgb = |c: (u8, u8, u8)| [c.0 as f32, c.1 as f32, c.2 as f32];
+        let target: [flow::Rgb; 3] = match self.palette {
+            Some(p) => p.map(rgb),
+            None => {
+                // No art: shades of the accent.
+                let a = rgb(self.accent.unwrap_or_else(system_accent));
+                [a, a.map(|v| v * 0.6), a.map(|v| v + (255.0 - v) * 0.3)]
+            }
+        };
+        // Ease between tracks while animating; snap when nothing is running.
+        let cur = match self.flow_cur {
+            Some(c) if self.timer_on => {
+                std::array::from_fn(|i| std::array::from_fn(|k| c[i][k] + (target[i][k] - c[i][k]) * 0.1))
+            }
+            _ => target,
+        };
+        self.flow_cur = Some(cur);
+        let base = [(pal.bg & 0xFF) as f32, ((pal.bg >> 8) & 0xFF) as f32, ((pal.bg >> 16) & 0xFF) as f32];
+        // The buffer is half size and stretched up, which keeps a frame cheap.
+        let (bw, bh) = ((w / 2).max(2), (h / 2).max(2));
+        let strength = if self.light { 0.45 } else { 0.65 };
+        flow::render(&mut self.flow_buf, bw as usize, bh as usize, self.flow_t, base, &cur, strength);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: bw,
+                biHeight: -bh,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe {
+            StretchDIBits(
+                hdc,
+                0,
+                0,
+                w,
+                h,
+                0,
+                0,
+                bw,
+                bh,
+                Some(self.flow_buf.as_ptr() as *const _),
+                &bmi,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
         }
     }
 
@@ -1042,6 +1180,11 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, stat
                     fill(hdc, brush, cx - u * 0.9, y - h / 2.0, cx - u * 0.9 + u * 2.0 * half, y + h / 2.0);
                 }
             }
+            Button::Minimize => {
+                // Thin centered dash, as light as the pin ring and the close cross.
+                let h = (u * 0.16).max(1.5);
+                fill(hdc, brush, cx - u * 0.6, cy - h / 2.0, cx + u * 0.6, cy + h / 2.0);
+            }
             Button::Volume | Button::Seek | Button::Pin | Button::Close => {}
         }
         SelectObject(hdc, old_pen);
@@ -1189,6 +1332,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         let bg = CreateSolidBrush(COLORREF(pal.bg));
         FillRect(hdc, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
         let _ = DeleteObject(bg.into());
+        ui.draw_flow(hdc, w, h, pal);
         SetBkMode(hdc, TRANSPARENT);
 
         // Album art, or a placeholder square.
@@ -1234,10 +1378,10 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             (ui.title.as_str(), ui.artist.as_str())
         };
         let left = s(TEXT_X);
-        let right = s(WIDTH - 12);
+        let right = s(width() - 12);
         SelectObject(hdc, title_font.into());
         SetTextColor(hdc, COLORREF(pal.title));
-        let mut r = RECT { left, top: s(26), right, bottom: s(46) };
+        let mut r = RECT { left, top: s(26), right: right - s(LIKE_W), bottom: s(46) };
         draw_text(hdc, title, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(hdc, artist_font.into());
         // A notice (sign-in progress, errors) replaces the artist line.
@@ -1255,8 +1399,8 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             let can = ui.enabled(Button::Seek);
             let hot = can && (ui.hover == Some(Button::Seek) || ui.pressed == Some(Button::Seek));
             let (pos, dur) = (ui.position_ms(), ui.dur_ms);
-            let width = bar.right - bar.left;
-            let filled = (width as f64 * pos as f64 / dur as f64) as i32;
+            let bar_w = bar.right - bar.left;
+            let filled = (bar_w as f64 * pos as f64 / dur as f64) as i32;
             let th = s(if hot { 6 } else { 4 });
             let cy = (bar.top + bar.bottom) / 2;
             let (y0, y1) = (cy - th / 2, cy - th / 2 + th);
@@ -1275,7 +1419,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             SetTextColor(hdc, COLORREF(pal.time));
             let mut r = RECT { left: s(TEXT_X), top: bar.top, right: s(TEXT_X + TIME_W), bottom: bar.bottom };
             draw_text(hdc, &fmt_time(pos), &mut r, DT_RIGHT | DT_VCENTER);
-            let mut r = RECT { left: bar.right + s(4), top: bar.top, right: s(WIDTH - 8), bottom: bar.bottom };
+            let mut r = RECT { left: bar.right + s(4), top: bar.top, right: s(width() - 8), bottom: bar.bottom };
             draw_text(hdc, &fmt_time(dur), &mut r, DT_LEFT | DT_VCENTER);
         }
 
@@ -1289,6 +1433,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             Button::Mute,
             Button::Like,
             Button::Lyrics,
+            Button::Minimize,
         ] {
             let rect = button_rect(hwnd, b);
             let enabled = ui.enabled(b);
@@ -1368,7 +1513,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             let bx = RECT {
                 left: s(PAD),
                 top: s(HEIGHT),
-                right: s(WIDTH - PAD),
+                right: s(width() - PAD),
                 bottom: s(HEIGHT + LYRICS_H - PAD),
             };
             fill_round(hdc, bx.left, bx.top, bx.right, bx.bottom, s(10), pal.art_bg);
@@ -1446,9 +1591,31 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             unsafe {
                 let _ = ScreenToClient(hwnd, &mut p);
             }
-            LRESULT(if button_at(hwnd, p).is_some() { HTCLIENT } else { HTCAPTION } as isize)
+            let client = button_at(hwnd, p).is_some() || edge_at(hwnd, p).is_some();
+            LRESULT(if client { HTCLIENT } else { HTCAPTION } as isize)
+        }
+        WM_SETCURSOR => {
+            if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                let mut p = POINT::default();
+                unsafe {
+                    let _ = GetCursorPos(&mut p);
+                    let _ = ScreenToClient(hwnd, &mut p);
+                }
+                let dragging = UI.with_borrow(|ui| ui.edge_drag.is_some());
+                if dragging || (button_at(hwnd, p).is_none() && edge_at(hwnd, p).is_some()) {
+                    unsafe {
+                        SetCursor(LoadCursorW(None, IDC_SIZEWE).ok());
+                    }
+                    return LRESULT(1);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSEMOVE => {
+            if let Some((left, anchor)) = UI.with_borrow(|ui| ui.edge_drag) {
+                drag_width(hwnd, left, anchor);
+                return LRESULT(0);
+            }
             let b = button_at(hwnd, client_point(lparam));
             let arm = UI.with_borrow_mut(|ui| {
                 let mut changed = ui.hover != b;
@@ -1490,6 +1657,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            let pt = client_point(lparam);
+            if button_at(hwnd, pt).is_none() {
+                if let Some(left) = edge_at(hwnd, pt) {
+                    let mut r = RECT::default();
+                    unsafe {
+                        let _ = GetWindowRect(hwnd, &mut r);
+                        SetCapture(hwnd);
+                    }
+                    UI.with_borrow_mut(|ui| ui.edge_drag = Some((left, if left { r.right } else { r.left })));
+                    return LRESULT(0);
+                }
+            }
             if let Some(b) = button_at(hwnd, client_point(lparam)) {
                 if UI.with_borrow(|ui| ui.enabled(b)) {
                     UI.with_borrow_mut(|ui| {
@@ -1510,6 +1689,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            if UI.with_borrow_mut(|ui| ui.edge_drag.take()).is_some() {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                save_state(hwnd);
+                return LRESULT(0);
+            }
             if let Some(pressed) = UI.with_borrow_mut(|ui| ui.pressed.take()) {
                 unsafe {
                     let _ = ReleaseCapture();
@@ -1592,7 +1778,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_NOWPLAYING => {
             // Ownership of the box passes from the worker thread to us.
             let np = unsafe { Box::from_raw(lparam.0 as *mut media::NowPlaying) };
-            let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            let mut visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            // Spotify just opened: bring the widget up, even if it was hidden to the tray.
+            let opened = np.active && !UI.with_borrow(|ui| ui.active);
+            if opened && !visible {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+                visible = true;
+            }
             UI.with_borrow_mut(|ui| ui.update(*np, visible));
             sync_timer(hwnd, visible);
             if visible {
@@ -1687,6 +1881,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 UI.with_borrow_mut(|ui| {
                     ui.art_freed = ui.art.is_some() || ui.art_freed;
                     ui.drop_art();
+                    ui.flow_buf = Vec::new();
                     // Lyrics text goes too; it is fetched again on show if the box is open.
                     ui.lyrics = LyricsView::Idle;
                     ui.lyrics_key.clear();
@@ -1717,7 +1912,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         // Explorer restarted: its tray is empty again.
         _ if msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
-            if let Ok(icon) = make_icon() {
+            if let Ok(icon) = make_icon(16) {
                 add_tray(hwnd, icon);
             }
             LRESULT(0)
@@ -1743,6 +1938,7 @@ fn main() -> Result<()> {
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
+            hIcon: make_icon(32).unwrap_or_default(),
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: CreateSolidBrush(COLORREF(palette(read_light_theme()).bg)),
@@ -1751,8 +1947,9 @@ fn main() -> Result<()> {
         RegisterClassW(&wc);
 
         let saved = load_state();
-        if let Some((_, _, top, lyrics)) = saved {
+        if let Some((_, _, top, lyrics, w)) = saved {
             TOPMOST.store(top, Ordering::Relaxed);
+            WIDTH_LP.store(w, Ordering::Relaxed);
             UI.with_borrow_mut(|ui| ui.lyrics_open = lyrics);
         }
         let ex = WS_EX_TOOLWINDOW
@@ -1766,19 +1963,19 @@ fn main() -> Result<()> {
             WS_POPUP,
             0,
             0,
-            WIDTH,
+            width(),
             HEIGHT,
             None,
             None,
             Some(instance.into()),
             None,
         )?;
-        let (w, h) = (scale(hwnd, WIDTH), scale(hwnd, window_height()));
-        let (x, y) = saved.map_or_else(|| default_position(w, h), |(x, y, _, _)| (x, y));
+        let (w, h) = (scale(hwnd, width()), scale(hwnd, window_height()));
+        let (x, y) = saved.map_or_else(|| default_position(w, h), |(x, y, ..)| (x, y));
         let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         create_tip(hwnd, instance.into())?;
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
-        add_tray(hwnd, make_icon()?);
+        add_tray(hwnd, make_icon(16)?);
 
         let round = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(
@@ -1789,7 +1986,10 @@ fn main() -> Result<()> {
         );
 
         UI.with_borrow_mut(|ui| ui.light = read_light_theme());
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // Started at login: stay in the tray until Spotify opens.
+        if !std::env::args().any(|a| a == "--autostart") {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
         media::spawn(hwnd, WM_NOWPLAYING);
         lyrics::spawn(hwnd, WM_LYRICS);
         spotify::spawn(hwnd, WM_SPOTIFY);

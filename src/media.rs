@@ -39,6 +39,47 @@ pub struct Art {
     pub bgra: Vec<u8>,
     /// Dominant vivid color (r, g, b), if the art has one.
     pub accent: Option<(u8, u8, u8)>,
+    /// Three distinct main colors, most common first, for the flowing background.
+    pub palette: [(u8, u8, u8); 3],
+}
+
+/// Three well-separated common colors: 8 levels per channel histogram, weighted toward
+/// saturated pixels, taking the heaviest bin and then the heaviest bins far from those chosen.
+/// Dark picks are lifted so the background shows them.
+fn palette_of(bgra: &[u8]) -> [(u8, u8, u8); 3] {
+    // Per bin: weight and weighted sums of r, g, b.
+    let mut bins = vec![(0f32, 0f32, 0f32, 0f32); 512];
+    for px in bgra.chunks_exact(4) {
+        let (b, g, r) = (px[0], px[1], px[2]);
+        let (max, min) = (r.max(g).max(b) as f32, r.min(g).min(b) as f32);
+        let w = 1.0 + 2.0 * if max > 0.0 { (max - min) / max } else { 0.0 };
+        let k = ((r >> 5) as usize) << 6 | ((g >> 5) as usize) << 3 | (b >> 5) as usize;
+        let e = &mut bins[k];
+        *e = (e.0 + w, e.1 + r as f32 * w, e.2 + g as f32 * w, e.3 + b as f32 * w);
+    }
+    let mean = |e: &(f32, f32, f32, f32)| [e.1 / e.0, e.2 / e.0, e.3 / e.0];
+    let mut picked: Vec<[f32; 3]> = Vec::new();
+    for _ in 0..3 {
+        let far = |c: &[f32; 3]| {
+            picked.iter().all(|p| (0..3).map(|i| (p[i] - c[i]).powi(2)).sum::<f32>() > 60.0 * 60.0)
+        };
+        let best = bins
+            .iter()
+            .filter(|e| e.0 > 0.0 && far(&mean(e)))
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some(e) = best {
+            picked.push(mean(e));
+        }
+    }
+    if picked.is_empty() {
+        picked.push([90.0, 90.0, 110.0]);
+    }
+    let lift = |c: [f32; 3]| {
+        let max = c[0].max(c[1]).max(c[2]).max(1.0);
+        let k = (110.0 / max).clamp(1.0, 3.0);
+        ((c[0] * k).min(255.0) as u8, (c[1] * k).min(255.0) as u8, (c[2] * k).min(255.0) as u8)
+    };
+    std::array::from_fn(|i| lift(picked[i.min(picked.len() - 1)]))
 }
 
 /// Most common vivid hue in the art: weight pixels by saturation, bucket by hue (12 buckets of
@@ -243,7 +284,8 @@ fn load_art(props: &Props) -> Option<Art> {
         return None;
     }
     let accent = accent_of(&bgra);
-    Some(Art { bgra, accent })
+    let palette = palette_of(&bgra);
+    Some(Art { bgra, accent, palette })
 }
 
 fn post(window: isize, msg: u32, np: NowPlaying) {

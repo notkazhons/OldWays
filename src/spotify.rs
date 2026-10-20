@@ -415,14 +415,14 @@ fn lookup_now(auth: &mut Auth) -> Result<Option<(String, Option<bool>)>, Failure
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric())
         .collect();
-    let c = api(auth, "GET", &format!("/v1/me/tracks/contains?ids={id}"), "")?;
+    // The per-type /me/tracks endpoints were removed in February 2026; the library ones take URIs.
+    let c = api(auth, "GET", &format!("/v1/me/library/contains?uris=spotify%3Atrack%3A{id}"), "")?;
     let liked = (c.status == 200).then(|| c.body.contains("true"));
     Ok(Some((id, liked)))
 }
 
 fn set_now(auth: &mut Auth, id: &str, liked: bool) -> Result<(), ()> {
     let method = if liked { "PUT" } else { "DELETE" };
-    let r = api(auth, method, &format!("/v1/me/tracks?ids={id}"), &format!("{{\"ids\":[\"{id}\"]}}"))
-        .map_err(|_| ())?;
+    let r = api(auth, method, &format!("/v1/me/library?uris=spotify%3Atrack%3A{id}"), "").map_err(|_| ())?;
     (r.status / 100 == 2).then_some(()).ok_or(())
 }
