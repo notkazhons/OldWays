@@ -1,7 +1,8 @@
 //! Spotify now-playing state from Windows media controls (SMTC), read on a worker thread.
-//! The thread sleeps on a channel; SMTC events wake it. It posts a `NowPlaying` to the window
-//! only when something the UI shows has changed.
+//! The thread sleeps on a channel; SMTC events and UI commands wake it. It posts a `NowPlaying`
+//! to the window only when something the UI shows has changed.
 
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Sender};
 
 use windows::Foundation::TypedEventHandler;
@@ -13,6 +14,7 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession as Session,
     GlobalSystemMediaTransportControlsSessionManager as Manager,
     GlobalSystemMediaTransportControlsSessionMediaProperties as Props,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -32,28 +34,60 @@ pub struct NowPlaying {
     pub title: String,
     pub artist: String,
     pub art: Option<Art>,
+    pub playing: bool,
+    pub can_prev: bool,
+    pub can_next: bool,
+    pub can_toggle: bool,
 }
 
-/// Event registration on the current session; removed when the session goes away.
+#[derive(Clone, Copy)]
+pub enum Command {
+    Toggle,
+    Next,
+    Prev,
+}
+
+enum Msg {
+    Refresh,
+    Command(Command),
+}
+
+static CONTROL: OnceLock<Sender<Msg>> = OnceLock::new();
+
+/// Ask the worker to run a playback command on Spotify.
+pub fn command(c: Command) {
+    if let Some(tx) = CONTROL.get() {
+        let _ = tx.send(Msg::Command(c));
+    }
+}
+
+/// Event registrations on the current session; removed when the session goes away.
 struct Subscription {
     session: Session,
-    token: i64,
+    media: i64,
+    playback: i64,
 }
 
 impl Subscription {
-    fn new(session: Session, tx: &Sender<()>) -> Result<Self> {
-        let tx = tx.clone();
-        let token = session.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx.send(());
+    fn new(session: Session, tx: &Sender<Msg>) -> Result<Self> {
+        let t = tx.clone();
+        let media = session.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
+            let _ = t.send(Msg::Refresh);
             Ok(())
         }))?;
-        Ok(Self { session, token })
+        let t = tx.clone();
+        let playback = session.PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
+            let _ = t.send(Msg::Refresh);
+            Ok(())
+        }))?;
+        Ok(Self { session, media, playback })
     }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let _ = self.session.RemoveMediaPropertiesChanged(self.token);
+        let _ = self.session.RemoveMediaPropertiesChanged(self.media);
+        let _ = self.session.RemovePlaybackInfoChanged(self.playback);
     }
 }
 
@@ -103,27 +137,80 @@ fn post(window: isize, msg: u32, np: NowPlaying) {
 /// the window procedure takes ownership.
 pub fn spawn(hwnd: HWND, msg: u32) {
     let window = hwnd.0 as isize;
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let _ = CONTROL.set(tx.clone());
     let _ = std::thread::Builder::new()
         .stack_size(512 * 1024)
         .spawn(move || {
-            let _ = run(window, msg);
+            let _ = run(window, msg, tx, rx);
         });
 }
 
-/// (active, title, artist, has art): what the UI shows.
-type Key = (bool, String, String, bool);
+/// What the UI shows. Used to skip posts when nothing visible changed.
+#[derive(PartialEq, Default)]
+struct Key {
+    active: bool,
+    title: String,
+    artist: String,
+    has_art: bool,
+    playing: bool,
+    can_prev: bool,
+    can_next: bool,
+    can_toggle: bool,
+}
 
-fn run(window: isize, msg: u32) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<()>();
+fn handle(manager: &Manager, msg: Msg) {
+    if let Msg::Command(c) = msg {
+        if let Ok(Some(session)) = find_spotify(manager) {
+            let op = match c {
+                Command::Toggle => session.TryTogglePlayPauseAsync(),
+                Command::Next => session.TrySkipNextAsync(),
+                Command::Prev => session.TrySkipPreviousAsync(),
+            };
+            let _ = op.and_then(|o| o.join());
+        }
+    }
+}
+
+fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
+    let props = session.TryGetMediaPropertiesAsync()?.join()?;
+    let title = props.Title()?.to_string();
+    let artist = props.Artist()?.to_string();
+    let info = session.GetPlaybackInfo()?;
+    let controls = info.Controls()?;
+    let playing = info.PlaybackStatus()? == Status::Playing;
+    let can_prev = controls.IsPreviousEnabled()?;
+    let can_next = controls.IsNextEnabled()?;
+    let can_toggle = controls.IsPlayEnabled()? || controls.IsPauseEnabled()?;
+
+    // Decode art only for a new track, or when it was missing last time.
+    let need_art = !last.active || last.title != title || last.artist != artist || !last.has_art;
+    let art = if need_art { load_art(&props) } else { None };
+    let has_art = if need_art { art.is_some() } else { true };
+    let key = Key {
+        active: true,
+        title: title.clone(),
+        artist: artist.clone(),
+        has_art,
+        playing,
+        can_prev,
+        can_next,
+        can_toggle,
+    };
+    Ok((NowPlaying { active: true, title, artist, art, playing, can_prev, can_next, can_toggle }, key))
+}
+
+fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Result<()> {
     let manager = Manager::RequestAsync()?.join()?;
     let t = tx.clone();
     manager.SessionsChanged(&TypedEventHandler::new(move |_, _| {
-        let _ = t.send(());
+        let _ = t.send(Msg::Refresh);
         Ok(())
     }))?;
 
     let mut sub: Option<Subscription> = None;
-    let mut last: Option<Key> = None;
+    let mut last = Key::default();
+    let mut first = true;
     loop {
         let (np, key) = match find_spotify(&manager)? {
             Some(session) => {
@@ -133,39 +220,47 @@ fn run(window: isize, msg: u32) -> Result<()> {
                 if !same {
                     sub = Some(Subscription::new(session.clone(), &tx)?);
                 }
-                match session.TryGetMediaPropertiesAsync().and_then(|op| op.join()) {
-                    Ok(props) => {
-                        let title = props.Title()?.to_string();
-                        let artist = props.Artist()?.to_string();
-                        // Decode art only for a new track, or when it was missing last time.
-                        let need_art = last
-                            .as_ref()
-                            .is_none_or(|l| !l.0 || l.1 != title || l.2 != artist || !l.3);
-                        let art = if need_art { load_art(&props) } else { None };
-                        let has_art = if need_art { art.is_some() } else { true };
-                        let key = (true, title.clone(), artist.clone(), has_art);
-                        (NowPlaying { active: true, title, artist, art }, key)
-                    }
-                    Err(_) => (NowPlaying { active: true, title: String::new(), artist: String::new(), art: None },
-                        (true, String::new(), String::new(), false)),
-                }
+                snapshot(&session, &last).unwrap_or_else(|_| {
+                    let empty = NowPlaying {
+                        active: true,
+                        title: String::new(),
+                        artist: String::new(),
+                        art: None,
+                        playing: false,
+                        can_prev: false,
+                        can_next: false,
+                        can_toggle: false,
+                    };
+                    (empty, Key { active: true, ..Default::default() })
+                })
             }
             None => {
                 sub = None;
-                (
-                    NowPlaying { active: false, title: String::new(), artist: String::new(), art: None },
-                    (false, String::new(), String::new(), false),
-                )
+                let empty = NowPlaying {
+                    active: false,
+                    title: String::new(),
+                    artist: String::new(),
+                    art: None,
+                    playing: false,
+                    can_prev: false,
+                    can_next: false,
+                    can_toggle: false,
+                };
+                (empty, Key::default())
             }
         };
-        if last.as_ref() != Some(&key) {
-            last = Some(key);
+        if first || last != key {
+            first = false;
+            last = key;
             post(window, msg, np);
         }
-        // Block until the next SMTC event; no polling.
-        if rx.recv().is_err() {
-            return Ok(());
+        // Block until the next SMTC event or command; no polling.
+        match rx.recv() {
+            Ok(m) => handle(&manager, m),
+            Err(_) => return Ok(()),
         }
-        while rx.try_recv().is_ok() {}
+        while let Ok(m) = rx.try_recv() {
+            handle(&manager, m);
+        }
     }
 }

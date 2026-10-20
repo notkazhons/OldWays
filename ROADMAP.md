@@ -38,7 +38,7 @@ Goal: draw track info in the window.
 - [x] Updates on SMTC events only.
 - [x] Empty state when Spotify is not running.
 
-## S5: Transport controls (todo)
+## S5: Transport controls (doing)
 Goal: control playback from the widget.
 - [ ] Play/pause, next, previous buttons with hover and pressed states.
 - [ ] Controls disabled when the action is not available.

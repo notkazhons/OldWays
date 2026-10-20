@@ -13,9 +13,13 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
     DeleteObject, DrawTextW, Ellipse, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject,
-    HALFTONE, HBITMAP, HDC, HFONT, InvalidateRect, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    PS_SOLID, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
-    StretchBlt, TRANSPARENT,
+    HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, InvalidateRect, NULL_BRUSH, NULL_PEN, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, PS_SOLID, Polygon, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode,
+    SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_LEFT,
+    VK_RIGHT, VK_SPACE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
@@ -285,12 +289,77 @@ fn tray_menu(hwnd: HWND) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Button {
+    Prev,
+    Toggle,
+    Next,
+    Pin,
+    Close,
+}
+
+const CTRL_LEFT: i32 = 96;
+const CTRL_TOP: i32 = 66;
+const CTRL_W: i32 = 32;
+const CTRL_H: i32 = 24;
+
+fn button_rect(hwnd: HWND, b: Button) -> RECT {
+    let ctrl = |i: i32| RECT {
+        left: scale(hwnd, CTRL_LEFT + i * CTRL_W),
+        top: scale(hwnd, CTRL_TOP),
+        right: scale(hwnd, CTRL_LEFT + (i + 1) * CTRL_W),
+        bottom: scale(hwnd, CTRL_TOP + CTRL_H),
+    };
+    match b {
+        Button::Prev => ctrl(0),
+        Button::Toggle => ctrl(1),
+        Button::Next => ctrl(2),
+        Button::Pin => pin_rect(hwnd),
+        Button::Close => close_rect(hwnd),
+    }
+}
+
+fn button_at(hwnd: HWND, p: POINT) -> Option<Button> {
+    [Button::Prev, Button::Toggle, Button::Next, Button::Pin, Button::Close]
+        .into_iter()
+        .find(|&b| in_rect(&button_rect(hwnd, b), p))
+}
+
+fn invalidate(hwnd: HWND) {
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+fn activate(hwnd: HWND, b: Button) {
+    match b {
+        Button::Close => unsafe {
+            let _ = DestroyWindow(hwnd);
+        },
+        Button::Pin => {
+            set_topmost(hwnd, !TOPMOST.load(Ordering::Relaxed));
+            save_state(hwnd);
+        }
+        Button::Toggle => media::command(media::Command::Toggle),
+        Button::Next => media::command(media::Command::Next),
+        Button::Prev => media::command(media::Command::Prev),
+    }
+}
+
 /// What the window shows. Lives on the UI thread; the worker only posts updates.
 struct Ui {
     active: bool,
     title: String,
     artist: String,
     art: Option<HBITMAP>,
+    playing: bool,
+    can_prev: bool,
+    can_next: bool,
+    can_toggle: bool,
+    hover: Option<Button>,
+    pressed: Option<Button>,
+    /// A WM_MOUSELEAVE request is outstanding.
+    tracking: bool,
     /// DPI the fonts were created for.
     dpi: u32,
     title_font: Option<HFONT>,
@@ -304,6 +373,13 @@ thread_local! {
             title: String::new(),
             artist: String::new(),
             art: None,
+            playing: false,
+            can_prev: false,
+            can_next: false,
+            can_toggle: false,
+            hover: None,
+            pressed: None,
+            tracking: false,
             dpi: 0,
             title_font: None,
             artist_font: None,
@@ -312,10 +388,23 @@ thread_local! {
 }
 
 impl Ui {
+    fn enabled(&self, b: Button) -> bool {
+        match b {
+            Button::Prev => self.can_prev,
+            Button::Next => self.can_next,
+            Button::Toggle => self.can_toggle,
+            Button::Pin | Button::Close => true,
+        }
+    }
+
     fn update(&mut self, np: media::NowPlaying) {
         self.active = np.active;
         self.title = np.title;
         self.artist = np.artist;
+        self.playing = np.playing;
+        self.can_prev = np.can_prev;
+        self.can_next = np.can_next;
+        self.can_toggle = np.can_toggle;
         // The previous bitmap is always replaced: a new track without art clears it.
         if let Some(old) = self.art.take() {
             unsafe {
@@ -372,6 +461,56 @@ impl Ui {
             self.artist_font = Some(make(13, FW_NORMAL.0 as i32));
         }
         (self.title_font.unwrap(), self.artist_font.unwrap())
+    }
+}
+
+fn pt(x: f32, y: f32) -> POINT {
+    POINT { x: x.round() as i32, y: y.round() as i32 }
+}
+
+fn fill(hdc: HDC, brush: HBRUSH, l: f32, t: f32, r: f32, b: f32) {
+    let rect = RECT { left: l.round() as i32, top: t.round() as i32, right: r.round() as i32, bottom: b.round() as i32 };
+    unsafe {
+        FillRect(hdc, &rect, brush);
+    }
+}
+
+/// Play/pause, next and previous glyphs, drawn from polygons and bars.
+fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, playing: bool) {
+    let (cx, cy) = ((rect.left + rect.right) as f32 / 2.0, (rect.top + rect.bottom) as f32 / 2.0);
+    let u = scale(hwnd, 7) as f32;
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let old_brush = SelectObject(hdc, brush.into());
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        match b {
+            Button::Toggle if playing => {
+                let (bw, gap) = (u * 0.55, u * 0.45);
+                fill(hdc, brush, cx - gap / 2.0 - bw, cy - u, cx - gap / 2.0, cy + u);
+                fill(hdc, brush, cx + gap / 2.0, cy - u, cx + gap / 2.0 + bw, cy + u);
+            }
+            Button::Toggle => {
+                let _ = Polygon(hdc, &[pt(cx - u * 0.7, cy - u), pt(cx - u * 0.7, cy + u), pt(cx + u * 0.9, cy)]);
+            }
+            Button::Next => {
+                let _ = Polygon(
+                    hdc,
+                    &[pt(cx - u * 0.8, cy - u * 0.8), pt(cx - u * 0.8, cy + u * 0.8), pt(cx + u * 0.5, cy)],
+                );
+                fill(hdc, brush, cx + u * 0.6, cy - u * 0.8, cx + u * 0.95, cy + u * 0.8);
+            }
+            Button::Prev => {
+                let _ = Polygon(
+                    hdc,
+                    &[pt(cx + u * 0.8, cy - u * 0.8), pt(cx + u * 0.8, cy + u * 0.8), pt(cx - u * 0.5, cy)],
+                );
+                fill(hdc, brush, cx - u * 0.95, cy - u * 0.8, cx - u * 0.6, cy + u * 0.8);
+            }
+            Button::Pin | Button::Close => {}
+        }
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(brush.into());
     }
 }
 
@@ -446,12 +585,31 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         let right = s(WIDTH - 12);
         SelectObject(hdc, title_font.into());
         SetTextColor(hdc, COLORREF(0x00F0F0F0));
-        let mut r = RECT { left, top: s(30), right, bottom: s(54) };
+        let mut r = RECT { left, top: s(26), right, bottom: s(46) };
         draw_text(hdc, title, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(hdc, artist_font.into());
         SetTextColor(hdc, COLORREF(0x00A0A0A0));
-        let mut r = RECT { left, top: s(54), right, bottom: s(76) };
+        let mut r = RECT { left, top: s(46), right, bottom: s(64) };
         draw_text(hdc, artist, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        // Transport buttons.
+        for b in [Button::Prev, Button::Toggle, Button::Next] {
+            let rect = button_rect(hwnd, b);
+            let enabled = ui.enabled(b);
+            let down = ui.pressed == Some(b);
+            let hot = enabled && (down || ui.hover == Some(b));
+            if hot {
+                let bg = CreateSolidBrush(COLORREF(if down { 0x00504A46 } else { 0x00383330 }));
+                let old_brush = SelectObject(hdc, bg.into());
+                let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+                let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, s(8), s(8));
+                SelectObject(hdc, old_pen);
+                SelectObject(hdc, old_brush);
+                let _ = DeleteObject(bg.into());
+            }
+            let color = if !enabled { 0x00505050 } else if hot { 0x00FFFFFF } else { 0x00D0D0D0 };
+            draw_icon(hwnd, hdc, b, &rect, COLORREF(color), ui.playing);
+        }
 
         // Buttons: close (x) and pin ring.
         SelectObject(hdc, title_font.into());
@@ -485,18 +643,76 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             unsafe {
                 let _ = ScreenToClient(hwnd, &mut p);
             }
-            let button = in_rect(&close_rect(hwnd), p) || in_rect(&pin_rect(hwnd), p);
-            LRESULT(if button { HTCLIENT } else { HTCAPTION } as isize)
+            LRESULT(if button_at(hwnd, p).is_some() { HTCLIENT } else { HTCAPTION } as isize)
+        }
+        WM_MOUSEMOVE => {
+            let b = button_at(hwnd, client_point(lparam));
+            let arm = UI.with_borrow_mut(|ui| {
+                let changed = ui.hover != b;
+                ui.hover = b;
+                let arm = !ui.tracking;
+                ui.tracking = true;
+                if changed {
+                    invalidate(hwnd);
+                }
+                arm
+            });
+            if arm {
+                let mut t = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe {
+                    let _ = TrackMouseEvent(&mut t);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            UI.with_borrow_mut(|ui| {
+                ui.hover = None;
+                ui.tracking = false;
+            });
+            invalidate(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            if let Some(b) = button_at(hwnd, client_point(lparam)) {
+                if UI.with_borrow(|ui| ui.enabled(b)) {
+                    UI.with_borrow_mut(|ui| ui.pressed = Some(b));
+                    unsafe {
+                        SetCapture(hwnd);
+                    }
+                    invalidate(hwnd);
+                }
+            }
+            LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let p = client_point(lparam);
-            if in_rect(&close_rect(hwnd), p) {
+            if let Some(pressed) = UI.with_borrow_mut(|ui| ui.pressed.take()) {
                 unsafe {
-                    let _ = DestroyWindow(hwnd);
+                    let _ = ReleaseCapture();
                 }
-            } else if in_rect(&pin_rect(hwnd), p) {
-                set_topmost(hwnd, !TOPMOST.load(Ordering::Relaxed));
-                save_state(hwnd);
+                invalidate(hwnd);
+                if button_at(hwnd, client_point(lparam)) == Some(pressed) {
+                    activate(hwnd, pressed);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            let b = match VIRTUAL_KEY(wparam.0 as u16) {
+                VK_SPACE => Some(Button::Toggle),
+                VK_LEFT => Some(Button::Prev),
+                VK_RIGHT => Some(Button::Next),
+                _ => None,
+            };
+            if let Some(b) = b {
+                if UI.with_borrow(|ui| ui.enabled(b)) {
+                    activate(hwnd, b);
+                }
             }
             LRESULT(0)
         }
