@@ -58,20 +58,20 @@ Goal: make it look good without costing memory.
 - [x] High DPI aware, crisp at 100% to 200% scaling.
 - [x] Smooth hover feedback without a constant animation timer.
 
-## S8: Tray and behavior (doing)
+## S8: Tray and behavior (done)
 Goal: stay out of the way.
 - [x] Tray icon with show/hide and quit (done in S3b).
 - [x] Optional start with Windows (tray menu checkbox, HKCU Run key).
 - [x] Single instance only.
 - [x] Hide to tray frees the album art bitmap.
 
-## S9: Shuffle, repeat, volume, like (doing)
+## S9: Shuffle, repeat, volume, like (done)
 Goal: the extras the media session does not cover in the original plan. Spotify's audio level is reachable through the Windows volume mixer without a login. Shuffle and repeat go through the media session. Only like needs the Web API.
 - [x] Shuffle and repeat buttons through the media session, both directions (clicks in the widget change Spotify, changes in Spotify show in the widget). Repeat cycles off, list, track. An earlier test wrongly showed Spotify ignoring the commands.
 - [x] Speaker button mutes; slider sets Spotify's level in the Windows volume mixer (separate from the slider inside Spotify).
-- [ ] Like button (heart, top right) through the Spotify Web API: OAuth with PKCE against the user's own Spotify developer app (client id in %APPDATA%\music-player-widget\spotify.txt), refresh token in Windows Credential Manager, tray menu Connect/Disconnect. Built; the PKCE challenge matches the RFC 7636 test vector. Not yet tried against a real account (needs the client id).
+- [x] Like button (heart, next to the title) through the Spotify Web API: OAuth with PKCE against the user's own Spotify developer app (client id in %APPDATA%\music-player-widget\spotify.txt), refresh token in Windows Credential Manager, tray menu Connect/Disconnect. Tried against a real account: it needs the `user-read-currently-playing` scope as well, and the `/me/library` endpoints (Spotify removed `/me/tracks` for development-mode apps in February 2026).
 - [x] No network traffic when the user has not logged in: the worker thread only waits on a channel until Connect is chosen.
-## S11: Lyrics box (doing)
+## S11: Lyrics box (done)
 Goal: a toggle shows a small box with the lyrics of the current track.
 - [x] Source: LRCLIB (lrclib.net), free public API, no key. The request sends artist, title, album and duration to that server. Synced lines when available, plain text as fallback, a short message when nothing is found.
 - [x] Fetch only while the box is open, on the worker thread, with WinHTTP (no extra crate). Keep the current track's lyrics only.
@@ -79,7 +79,7 @@ Goal: a toggle shows a small box with the lyrics of the current track.
 - [x] Synced lyrics highlight the current line and follow the playback position. Reuse the existing 1 Hz timer, nothing new when the box is closed.
 - [x] Hide to tray or closing the box frees the lyrics text.
 
-## S10: Efficiency pass and release (todo)
+## S10: Efficiency pass and release (doing)
 Goal: measure and lock in the budget.
 - [x] Measure working set and CPU idle, playing and paused. Measured 2026-10-20 on the release build (Windows 11, Spotify playing a track, 483x140 window, flowing background on). CPU is the share of the whole machine, sampled over 10-15 s:
 
@@ -91,5 +91,6 @@ Goal: measure and lock in the budget.
   | paused, hidden | 0.04% | 2.2 MB | 6.3 MB |
 
 - [x] Fix anything over budget. Nothing is over: private working set stays under 15 MB playing and 10 MB idle. Paused CPU is not exactly 0 because Spotify's own events still wake the widget, but it is at noise level. The redraw timer (50 ms, for the flowing background) runs only while playing and visible.
-- [ ] Release build under 1 MB if reasonable, zipped to GitHub Releases.
-- [ ] README has install, usage and screenshots.
+- [x] Release build under 1 MB (about 620 KB, C runtime linked statically so no redistributable is needed).
+- [ ] Zipped and attached to a GitHub release.
+- [x] README has install, usage and screenshots.
