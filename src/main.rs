@@ -1197,16 +1197,23 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, stat
                 }
             }
             Button::Copy => {
-                // Two overlapping sheets, the usual copy glyph.
-                let (a, d) = (u * 0.55, u * 0.4);
-                stroke(&[(cx - a + d, cy - a - d), (cx + a + d, cy - a - d), (cx + a + d, cy + a - d)]);
-                stroke(&[
-                    (cx - a - d, cy - a + d),
-                    (cx + a - d, cy - a + d),
-                    (cx + a - d, cy + a + d),
-                    (cx - a - d, cy + a + d),
-                    (cx - a - d, cy - a + d),
-                ]);
+                // Two interlocked chain links, running bottom-left to top-right.
+                let (h, r) = (u * 0.45, u * 0.42);
+                let (cos_t, sin_t) = ((-45f32).to_radians().cos(), (-45f32).to_radians().sin());
+                for off in [-0.62 * u, 0.62 * u] {
+                    let (ox, oy) = (cx + off * cos_t, cy + off * sin_t);
+                    // Stadium outline in link-local coordinates: a half circle at each end.
+                    let mut pts = Vec::new();
+                    for (end, from) in [(h, -90.0f32), (-h, 90.0)] {
+                        for k in 0..=8 {
+                            let a = (from + k as f32 * 22.5).to_radians();
+                            let (x, y) = (end + r * a.cos(), r * a.sin());
+                            pts.push((ox + x * cos_t - y * sin_t, oy + x * sin_t + y * cos_t));
+                        }
+                    }
+                    pts.push(pts[0]);
+                    stroke(&pts);
+                }
             }
             Button::Like => {
                 // Heart curve; filled when liked, outline otherwise.
