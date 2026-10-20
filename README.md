@@ -111,4 +111,4 @@ Two small console tools live in `src/bin` (`probe`, `lyrics_probe`) for checking
 
 ## License
 
-No license has been chosen yet.
+MIT. See [LICENSE](LICENSE).
