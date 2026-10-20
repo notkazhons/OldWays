@@ -379,7 +379,10 @@ fn trim_memory() {
 /// Sign in to Spotify, or open the config file first when there is no client ID yet.
 fn start_spotify_sign_in() {
     if spotify::client_id().is_some() {
-        UI.with_borrow_mut(|ui| ui.notice = Some("Finish signing in in your browser"));
+        UI.with_borrow_mut(|ui| {
+            ui.notice = Some("Finish signing in in your browser");
+            ui.notice_at = None;
+        });
         spotify::connect();
     } else {
         spotify::open_config();
@@ -619,6 +622,7 @@ fn activate(hwnd: HWND, b: Button) {
             });
             let done = copy_text(hwnd, &url);
             UI.with_borrow_mut(|ui| {
+                ui.notice_at = Some(Instant::now());
                 ui.notice = Some(match (done, ok) {
                     (false, _) => "Couldn't copy",
                     (true, true) => "Track link copied",
@@ -665,6 +669,7 @@ fn activate(hwnd: HWND, b: Button) {
         Button::Like => {
             let action = UI.with_borrow_mut(|ui| {
                 ui.notice = None;
+                ui.notice_at = None;
                 if !ui.spotify_connected {
                     return None;
                 }
@@ -780,6 +785,11 @@ fn ensure_lyrics() {
 }
 
 const TIMER_ID: usize = 1;
+/// Frame timer for a fading notice; runs only while one is showing.
+const NOTICE_TIMER: usize = 2;
+/// Seconds a timed notice holds before fading, and how long each fade step takes.
+const NOTICE_HOLD: f32 = 2.5;
+const NOTICE_FADE: f32 = 0.4;
 /// Sent when the system accent color changes (not exposed by the bindings).
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 
@@ -825,6 +835,8 @@ struct Ui {
     like_key: String,
     /// A short message shown in place of the artist line until the next click or track.
     notice: Option<&'static str>,
+    /// When set, the notice fades out this long after it appeared; otherwise it stays until cleared.
+    notice_at: Option<Instant>,
     lyrics_open: bool,
     lyrics: LyricsView,
     /// Track the lyrics (or the pending request) belong to.
@@ -891,6 +903,7 @@ thread_local! {
             like_id: String::new(),
             like_key: String::new(),
             notice: None,
+            notice_at: None,
             lyrics_open: false,
             lyrics: LyricsView::Idle,
             lyrics_key: String::new(),
@@ -1185,7 +1198,7 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, stat
             }
             Button::Copy => {
                 // Two overlapping sheets, the usual copy glyph.
-                let (a, d) = (u * 0.85, u * 0.45);
+                let (a, d) = (u * 0.55, u * 0.4);
                 stroke(&[(cx - a + d, cy - a - d), (cx + a + d, cy - a - d), (cx + a + d, cy + a - d)]);
                 stroke(&[
                     (cx - a - d, cy - a + d),
@@ -1397,6 +1410,16 @@ fn fill_round_alpha(hdc: HDC, l: i32, t: i32, r: i32, b: i32, radius: i32, color
     }
 }
 
+/// Blend two 0x00BBGGRR colors; `t` 0 gives `a`, 1 gives `b`.
+fn mix_color(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |shift: u32| {
+        let (x, y) = (((a >> shift) & 0xFF) as f32, ((b >> shift) & 0xFF) as f32);
+        ((x + (y - x) * t) as u32) << shift
+    };
+    ch(0) | ch(8) | ch(16)
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
@@ -1475,10 +1498,33 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         draw_text(hdc, title, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(hdc, artist_font.into());
         // A notice (sign-in progress, errors) replaces the artist line.
-        let (artist, artist_color) = match ui.notice {
-            Some(n) => (n, accent),
-            None => (artist, pal.artist),
+        // A timed notice holds, fades out, then the artist fades back in.
+        let mut ticking = false;
+        let (artist, artist_color) = match (ui.notice, ui.notice_at) {
+            (Some(n), Some(at)) => {
+                let age = at.elapsed().as_secs_f32();
+                ticking = true;
+                if age < NOTICE_HOLD {
+                    (n, accent)
+                } else if age < NOTICE_HOLD + NOTICE_FADE {
+                    (n, mix_color(accent, pal.bg, (age - NOTICE_HOLD) / NOTICE_FADE))
+                } else if age < NOTICE_HOLD + 2.0 * NOTICE_FADE {
+                    (artist, mix_color(pal.bg, pal.artist, (age - NOTICE_HOLD - NOTICE_FADE) / NOTICE_FADE))
+                } else {
+                    ui.notice = None;
+                    ui.notice_at = None;
+                    ticking = false;
+                    (artist, pal.artist)
+                }
+            }
+            (Some(n), None) => (n, accent),
+            _ => (artist, pal.artist),
         };
+        if ticking {
+            SetTimer(Some(hwnd), NOTICE_TIMER, FRAME_MS, None);
+        } else {
+            let _ = KillTimer(Some(hwnd), NOTICE_TIMER);
+        }
         SetTextColor(hdc, COLORREF(artist_color));
         let mut r = RECT { left, top: s(46), right, bottom: s(64) };
         draw_text(hdc, artist, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
@@ -1899,6 +1945,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 spotify::Event::Connected(on) => {
                     ui.spotify_connected = on;
                     ui.notice = None;
+                    ui.notice_at = None;
                     // Force a fresh lookup (or clear the heart) for the current track.
                     ui.like_key.clear();
                 }
@@ -1908,7 +1955,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         ui.like = liked;
                     }
                 }
-                spotify::Event::Notice(n) => ui.notice = Some(n),
+                spotify::Event::Notice(n) => {
+                    ui.notice = Some(n);
+                    ui.notice_at = None;
+                }
             });
             ensure_like();
             invalidate(hwnd);
@@ -1965,7 +2015,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_TIMER => {
-            if wparam.0 == TIMER_ID {
+            if wparam.0 == TIMER_ID || wparam.0 == NOTICE_TIMER {
                 invalidate(hwnd);
             }
             LRESULT(0)
