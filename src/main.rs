@@ -1540,7 +1540,13 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
                 right: s(width() - PAD),
                 bottom: s(HEIGHT + LYRICS_H - PAD),
             };
-            fill_round_alpha(hdc, bx.left, bx.top, bx.right, bx.bottom, s(10), pal.art_bg, 128);
+            // Tinted by the art instead of plain grey: a deep shade of the main color (dark theme) or a
+            // pale wash of it (light theme), kept see-through.
+            let tint = ui.flow_cur.map_or([0.0; 3], |c| c[0]);
+            let (mix, white) = if ui.light { (0.12, 1.0) } else { (0.2, 0.0) };
+            let ch = |v: f32| (white * (1.0 - mix) * 255.0 + v * mix).clamp(0.0, 255.0) as u32;
+            let box_color = ch(tint[0]) | ch(tint[1]) << 8 | ch(tint[2]) << 16;
+            fill_round_alpha(hdc, bx.left, bx.top, bx.right, bx.bottom, s(10), box_color, if ui.light { 140 } else { 150 });
             let line_h = s(LYRIC_LINE_H);
             let top = bx.top + (bx.bottom - bx.top - line_h * LYRIC_LINES) / 2;
             let (lx, rx) = (bx.left + s(10), bx.right - s(10));
