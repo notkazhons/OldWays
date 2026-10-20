@@ -36,7 +36,7 @@ fn wide(s: &str) -> Vec<u16> {
 pub fn request(method: &str, host: &str, path: &str, headers: &str, body: &[u8]) -> Result<Response, ()> {
     unsafe {
         let session = Handle(WinHttpOpen(
-            w!("music-player-widget/0.1 (https://github.com/notkazhons/music-player-widget)"),
+            w!("OldWays/0.1 (https://github.com/notkazhons/OldWays)"),
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             PCWSTR::null(),
             PCWSTR::null(),

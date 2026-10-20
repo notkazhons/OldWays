@@ -1,4 +1,4 @@
-﻿# Roadmap
+﻿# OldWays roadmap
 
 Each story has a goal and acceptance criteria. A story is done when every criterion is checked. Work in order; one story per commit or small group of commits. Update the status here when a story finishes.
 
@@ -69,7 +69,7 @@ Goal: stay out of the way.
 Goal: the extras the media session does not cover in the original plan. Spotify's audio level is reachable through the Windows volume mixer without a login. Shuffle and repeat go through the media session. Only like needs the Web API.
 - [x] Shuffle and repeat buttons through the media session, both directions (clicks in the widget change Spotify, changes in Spotify show in the widget). Repeat cycles off, list, track. An earlier test wrongly showed Spotify ignoring the commands.
 - [x] Speaker button mutes; slider sets Spotify's level in the Windows volume mixer (separate from the slider inside Spotify).
-- [x] Like button (heart, next to the title) through the Spotify Web API: OAuth with PKCE against the user's own Spotify developer app (client id in %APPDATA%\music-player-widget\spotify.txt), refresh token in Windows Credential Manager, tray menu Connect/Disconnect. Tried against a real account: it needs the `user-read-currently-playing` scope as well, and the `/me/library` endpoints (Spotify removed `/me/tracks` for development-mode apps in February 2026).
+- [x] Like button (heart, next to the title) through the Spotify Web API: OAuth with PKCE against the user's own Spotify developer app (client id in %APPDATA%\OldWays\spotify.txt), refresh token in Windows Credential Manager, tray menu Connect/Disconnect. Tried against a real account: it needs the `user-read-currently-playing` scope as well, and the `/me/library` endpoints (Spotify removed `/me/tracks` for development-mode apps in February 2026).
 - [x] No network traffic when the user has not logged in: the worker thread only waits on a channel until Connect is chosen.
 ## S11: Lyrics box (done)
 Goal: a toggle shows a small box with the lyrics of the current track.

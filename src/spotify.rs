@@ -1,6 +1,6 @@
 //! Spotify Web API, used only for the "like" (Liked Songs) heart. Everything else the widget
 //! does needs no login. Sign-in is OAuth with PKCE against the user's own Spotify developer app
-//! (client ID in `%APPDATA%\music-player-widget\spotify.txt`); the refresh token lives in the
+//! (client ID in `%APPDATA%\OldWays\spotify.txt`); the refresh token lives in the
 //! Windows Credential Manager. Until the user connects, this thread never touches the network.
 
 use std::io::{Read, Write};
@@ -73,7 +73,7 @@ pub fn set_liked(key: String, id: String, liked: bool) {
 }
 
 fn config_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("music-player-widget").join("spotify.txt"))
+    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("OldWays").join("spotify.txt"))
 }
 
 /// First non-comment line of the config file.
@@ -119,12 +119,14 @@ fn open(target: &str) {
 
 // ---- Credential Manager -------------------------------------------------------------------
 
-const CRED_TARGET: PCWSTR = w!("music-player-widget/spotify");
+const CRED_TARGET: PCWSTR = w!("OldWays/spotify");
+/// Where the token was kept before the rename.
+const OLD_CRED_TARGET: PCWSTR = w!("music-player-widget/spotify");
 
-fn load_refresh_token() -> Option<String> {
+fn read_credential(target: PCWSTR) -> Option<String> {
     unsafe {
         let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
-        CredReadW(CRED_TARGET, CRED_TYPE_GENERIC, None, &mut cred).ok()?;
+        CredReadW(target, CRED_TYPE_GENERIC, None, &mut cred).ok()?;
         let c = &*cred;
         let bytes = std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize);
         let token = String::from_utf8(bytes.to_vec()).ok();
@@ -133,12 +135,25 @@ fn load_refresh_token() -> Option<String> {
     }
 }
 
+/// The stored token, moving one saved under the old name to the new one so nobody signs in twice.
+fn load_refresh_token() -> Option<String> {
+    if let Some(t) = read_credential(CRED_TARGET) {
+        return Some(t);
+    }
+    let old = read_credential(OLD_CRED_TARGET)?;
+    store_refresh_token(&old);
+    unsafe {
+        let _ = CredDeleteW(OLD_CRED_TARGET, CRED_TYPE_GENERIC, None);
+    }
+    Some(old)
+}
+
 fn store_refresh_token(token: &str) {
     let mut blob = token.as_bytes().to_vec();
     let mut user: Vec<u16> = "spotify".encode_utf16().chain(Some(0)).collect();
     let cred = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
-        TargetName: PWSTR(w!("music-player-widget/spotify").as_ptr() as *mut u16),
+        TargetName: PWSTR(CRED_TARGET.as_ptr() as *mut u16),
         CredentialBlobSize: blob.len() as u32,
         CredentialBlob: blob.as_mut_ptr(),
         Persist: CRED_PERSIST_LOCAL_MACHINE,
@@ -340,7 +355,7 @@ fn sign_in() -> Result<Auth, &'static str> {
                 };
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!doctype html><title>Music Player Widget</title><body style=\"font-family:sans-serif;padding:2em\">{page}</body>"
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!doctype html><title>OldWays</title><body style=\"font-family:sans-serif;padding:2em\">{page}</body>"
                 );
                 if let Some(q) = query {
                     break q;

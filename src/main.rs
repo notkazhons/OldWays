@@ -152,8 +152,17 @@ fn in_rect(r: &RECT, p: POINT) -> bool {
 }
 
 fn state_path() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("music-player-widget");
+    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("OldWays");
     Some(dir.join("window.txt"))
+}
+
+/// Settings from before the rename lived in another folder; move it over once.
+fn migrate_data_dir() {
+    let Some(base) = std::env::var_os("APPDATA").map(PathBuf::from) else { return };
+    let (old, new) = (base.join("music-player-widget"), base.join("OldWays"));
+    if old.exists() && !new.exists() {
+        let _ = std::fs::rename(old, new);
+    }
 }
 
 /// Saved position, topmost flag, lyrics-box flag and width, if the file exists and the spot is still on screen.
@@ -315,7 +324,7 @@ fn add_tray(hwnd: HWND, icon: HICON) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = icon;
-    for (dst, src) in nid.szTip.iter_mut().zip("Music Player Widget".encode_utf16()) {
+    for (dst, src) in nid.szTip.iter_mut().zip("OldWays".encode_utf16()) {
         *dst = src;
     }
     unsafe {
@@ -344,7 +353,9 @@ fn cursor() -> POINT {
 }
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: PCWSTR = w!("MusicPlayerWidget");
+const RUN_VALUE: PCWSTR = w!("OldWays");
+/// The Run entry name before the rename.
+const OLD_RUN_VALUE: PCWSTR = w!("MusicPlayerWidget");
 
 fn autostart_enabled() -> bool {
     unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None) }.is_ok()
@@ -366,6 +377,20 @@ fn set_autostart(on: bool) {
         } else {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
         }
+    }
+}
+
+/// A login entry made before the rename points at the old exe: replace it with this one.
+fn migrate_autostart() {
+    let had_old = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, OLD_RUN_VALUE, RRF_RT_REG_SZ, None, None, None)
+    }
+    .is_ok();
+    if had_old {
+        unsafe {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, OLD_RUN_VALUE);
+        }
+        set_autostart(true);
     }
 }
 
@@ -2087,17 +2112,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 fn main() -> Result<()> {
     unsafe {
         // One instance only: a second launch pokes the first one and exits.
-        let _single = CreateMutexW(None, true, w!("Local\\MusicPlayerWidgetSingleInstance"))?;
+        let _single = CreateMutexW(None, true, w!("Local\\OldWaysSingleInstance"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Ok(existing) = FindWindowW(w!("MusicPlayerWidget"), None) {
+            if let Ok(existing) = FindWindowW(w!("OldWays"), None) {
                 let _ = PostMessageW(Some(existing), WM_SHOW_REQUEST, WPARAM(0), LPARAM(0));
             }
             return Ok(());
         }
 
+        migrate_data_dir();
+        migrate_autostart();
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance = GetModuleHandleW(None)?;
-        let class = w!("MusicPlayerWidget");
+        let class = w!("OldWays");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
@@ -2122,7 +2149,7 @@ fn main() -> Result<()> {
         let hwnd = CreateWindowExW(
             ex,
             class,
-            w!("Music Player Widget"),
+            w!("OldWays"),
             WS_POPUP,
             0,
             0,

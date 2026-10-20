@@ -1,8 +1,8 @@
-﻿# Music Player Widget
+﻿# OldWays
 
-A tiny native Windows widget that shows what Spotify is playing and controls it. It sits on your desktop, wears the colors of the album art, and uses almost no memory or CPU.
+OldWays is a tiny native Windows widget that shows what Spotify is playing and controls it. It sits on your desktop, wears the colors of the album art, and uses almost no memory or CPU.
 
-**Website: https://notkazhons.github.io/music-player-widget/**
+**Website: https://notkazhons.github.io/OldWays/**
 
 ![Widget](docs/main.png)
 
@@ -33,10 +33,10 @@ It does not play audio. Spotify keeps playing; the widget is a remote and a disp
 ## Install
 
 1. Download the zip from the [Releases](../../releases) page and unzip it anywhere.
-2. Run `music-player-widget.exe`.
+2. Run `oldways.exe`.
 3. Right-click the tray icon and tick **Start with Windows** if you want it to start at login. It then waits in the tray and shows itself when Spotify opens.
 
-To remove it, untick **Start with Windows**, choose **Quit** from the tray menu, and delete the exe and the folder `%APPDATA%\music-player-widget`.
+To remove it, untick **Start with Windows**, choose **Quit** from the tray menu, and delete the exe and the folder `%APPDATA%\OldWays`.
 
 ## Using it
 
@@ -58,12 +58,12 @@ Everything above works without logging in. Only the heart needs the Spotify Web 
 1. Go to the [Spotify developer dashboard](https://developer.spotify.com/dashboard) and create an app. The app owner needs Spotify Premium.
 2. In the app's settings, add this redirect URI exactly: `http://127.0.0.1:8888/callback`
 3. Copy the app's **Client ID**.
-4. Click the heart in the widget (or choose **Connect Spotify** in the tray menu). It opens `%APPDATA%\music-player-widget\spotify.txt`. Paste the Client ID on its own line below the comments and save.
+4. Click the heart in the widget (or choose **Connect Spotify** in the tray menu). It opens `%APPDATA%\OldWays\spotify.txt`. Paste the Client ID on its own line below the comments and save.
 5. Click the heart again. Your browser opens the Spotify approval page. Approve it once.
 
 After that the heart shows whether the playing track is in Liked Songs, and clicking it adds or removes the track. Choose **Disconnect Spotify** in the tray menu to sign out.
 
-The sign-in uses OAuth with PKCE, so there is no client secret. The refresh token is kept in Windows Credential Manager. If something fails, Spotify's error text is written to `%APPDATA%\music-player-widget\spotify.log` (no tokens in it).
+The sign-in uses OAuth with PKCE, so there is no client secret. The refresh token is kept in Windows Credential Manager. If something fails, Spotify's error text is written to `%APPDATA%\OldWays\spotify.log` (no tokens in it).
 
 If sign-in says "Port 8888 is busy", close the program using that port and try again.
 
@@ -89,19 +89,19 @@ The exe is about 620 KB. Hiding the widget frees the album art and lyrics. The r
 
 No analytics, no telemetry, no other network traffic. Until you connect Spotify, the Spotify worker never touches the network.
 
-Files the widget keeps in `%APPDATA%\music-player-widget`: `window.txt` (position, width, pin and lyrics state), `spotify.txt` (your client ID) and `spotify.log`.
+Files the widget keeps in `%APPDATA%\OldWays`: `window.txt` (position, width, pin and lyrics state), `spotify.txt` (your client ID) and `spotify.log`.
 
 ## Build from source
 
 You need [Rust](https://rustup.rs) and the Microsoft C++ build tools (the "Desktop development with C++" workload, which includes the Windows SDK).
 
 ```
-git clone https://github.com/notkazhons/music-player-widget
-cd music-player-widget
+git clone https://github.com/notkazhons/OldWays
+cd OldWays
 cargo build --release
 ```
 
-The exe is at `target\release\music-player-widget.exe`. The only crates are `windows` (Win32 and WinRT bindings) and `embed-resource` (to embed the icon at build time). The C runtime is linked statically, so the exe runs on a PC without the Visual C++ redistributable.
+The exe is at `target\release\oldways.exe`. The only crates are `windows` (Win32 and WinRT bindings) and `embed-resource` (to embed the icon at build time). The C runtime is linked statically, so the exe runs on a PC without the Visual C++ redistributable.
 
 Two small console tools live in `src/bin` (`probe`, `lyrics_probe`) for checking the media session and the lyrics lookup.
 
