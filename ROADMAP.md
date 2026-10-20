@@ -44,12 +44,12 @@ Goal: control playback from the widget.
 - [x] Controls disabled when the action is not available.
 - [x] Keyboard focus and basic shortcuts when the widget is focused (space, left, right).
 
-## S6: Progress bar and seek (doing)
+## S6: Progress bar and seek (done)
 Goal: show and change position.
 - [x] Progress bar and elapsed/total time.
 - [x] Redraw timer runs only while playing and the window is visible, at most 1 Hz.
-- [ ] Click or drag on the bar seeks.
-- [ ] Timer fully stops on pause, minimize or hide.
+- [x] Click or drag on the bar seeks.
+- [x] Timer fully stops on pause, minimize or hide.
 
 ## S7: Look and feel (todo)
 Goal: make it look good without costing memory.
