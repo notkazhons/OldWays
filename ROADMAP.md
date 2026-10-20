@@ -69,8 +69,8 @@ Goal: stay out of the way.
 Goal: the extras the media session does not cover in the original plan. Spotify's audio level is reachable through the Windows volume mixer without a login. Shuffle and repeat go through the media session. Only like needs the Web API.
 - [x] Shuffle and repeat buttons through the media session, both directions (clicks in the widget change Spotify, changes in Spotify show in the widget). Repeat cycles off, list, track. An earlier test wrongly showed Spotify ignoring the commands.
 - [x] Speaker button mutes; slider sets Spotify's level in the Windows volume mixer (separate from the slider inside Spotify).
-- [ ] Like button (needs the Spotify Web API): OAuth with PKCE against a Spotify developer app (client id from the user), refresh token in Windows Credential Manager. Not started.
-- [ ] No extra network traffic or memory when the user has not logged in.
+- [ ] Like button (heart, top right) through the Spotify Web API: OAuth with PKCE against the user's own Spotify developer app (client id in %APPDATA%\music-player-widget\spotify.txt), refresh token in Windows Credential Manager, tray menu Connect/Disconnect. Built; the PKCE challenge matches the RFC 7636 test vector. Not yet tried against a real account (needs the client id).
+- [x] No network traffic when the user has not logged in: the worker thread only waits on a channel until Connect is chosen.
 ## S11: Lyrics box (doing)
 Goal: a toggle shows a small box with the lyrics of the current track.
 - [x] Source: LRCLIB (lrclib.net), free public API, no key. The request sends artist, title, album and duration to that server. Synced lines when available, plain text as fallback, a short message when nothing is found.

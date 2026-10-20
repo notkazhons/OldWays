@@ -2,19 +2,13 @@
 //! A request sends the track's artist, title, album and length to that server. The thread
 //! sleeps on a channel and only runs while the lyrics box asks for a track.
 
-use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Sender};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Networking::WinHttp::{
-    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetTimeouts,
-};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-use windows::core::{PCWSTR, w};
+
+use crate::http;
 
 pub struct Request {
     /// Identifies the track; echoed back so the UI can drop stale answers.
@@ -69,24 +63,18 @@ pub fn spawn(hwnd: HWND, msg: u32) {
     });
 }
 
-fn encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+/// HTTPS GET to lrclib.net. Returns (status code, body).
+fn get(path: &str) -> Result<(u32, String), ()> {
+    http::request("GET", "lrclib.net", path, "", &[]).map(|r| (r.status, r.body))
 }
 
 /// Blocking lookup; also used by the `lyrics_probe` dev binary.
 pub fn fetch(req: &Request) -> Body {
     let exact = format!(
         "/api/get?artist_name={}&track_name={}&album_name={}&duration={}",
-        encode(&req.artist),
-        encode(&req.title),
-        encode(&req.album),
+        http::encode(&req.artist),
+        http::encode(&req.title),
+        http::encode(&req.album),
         req.duration_ms / 1000
     );
     let reply = match get(&exact) {
@@ -96,8 +84,8 @@ pub fn fetch(req: &Request) -> Body {
         _ => {
             let search = format!(
                 "/api/search?artist_name={}&track_name={}",
-                encode(&req.artist),
-                encode(&req.title)
+                http::encode(&req.artist),
+                http::encode(&req.title)
             );
             match get(&search) {
                 Ok((200, body)) => Ok(body),
@@ -116,13 +104,13 @@ fn parse(body: &str) -> Body {
     if body.contains("\"instrumental\":true") {
         return Body::Message("Instrumental");
     }
-    if let Some(lrc) = json_string(body, "syncedLyrics").filter(|s| !s.trim().is_empty()) {
+    if let Some(lrc) = http::json_string(body, "syncedLyrics").filter(|s| !s.trim().is_empty()) {
         let lines = parse_lrc(&lrc);
         if !lines.is_empty() {
             return Body::Synced(lines);
         }
     }
-    if let Some(plain) = json_string(body, "plainLyrics").filter(|s| !s.trim().is_empty()) {
+    if let Some(plain) = http::json_string(body, "plainLyrics").filter(|s| !s.trim().is_empty()) {
         return Body::Plain(plain.lines().map(|l| l.trim().to_string()).collect());
     }
     Body::Message("No lyrics found")
@@ -161,127 +149,4 @@ fn timestamp(s: &str) -> Option<i64> {
         _ => frac.get(..3)?.parse::<i64>().ok()?,
     };
     Some(min.parse::<i64>().ok()? * 60_000 + sec.parse::<i64>().ok()? * 1000 + ms)
-}
-
-/// Value of the first `"key": "..."` string in a JSON document; `None` for null or absent.
-fn json_string(body: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\":");
-    let after = body[body.find(&pat)? + pat.len()..].trim_start();
-    let mut chars = after.strip_prefix('"')?.chars();
-    let mut out = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                'b' => out.push('\u{8}'),
-                'f' => out.push('\u{c}'),
-                'u' => {
-                    let hi = hex4(&mut chars)?;
-                    if (0xD800..0xDC00).contains(&hi) {
-                        // Surrogate pair: expect "\uXXXX" next.
-                        if chars.next()? != '\\' || chars.next()? != 'u' {
-                            return None;
-                        }
-                        let lo = hex4(&mut chars)?;
-                        let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo.checked_sub(0xDC00)?);
-                        out.push(char::from_u32(cp)?);
-                    } else {
-                        out.push(char::from_u32(hi)?);
-                    }
-                }
-                other => out.push(other),
-            },
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-fn hex4(chars: &mut std::str::Chars) -> Option<u32> {
-    let mut v = 0;
-    for _ in 0..4 {
-        v = v * 16 + chars.next()?.to_digit(16)?;
-    }
-    Some(v)
-}
-
-/// RAII wrapper so every exit path closes the WinHTTP handle.
-struct Handle(*mut c_void);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                let _ = WinHttpCloseHandle(self.0);
-            }
-        }
-    }
-}
-
-/// HTTPS GET to lrclib.net. Returns (status code, body).
-fn get(path: &str) -> std::result::Result<(u32, String), ()> {
-    unsafe {
-        let session = Handle(WinHttpOpen(
-            w!("music-player-widget/0.1 (https://github.com/notkazhons/music-player-widget)"),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        ));
-        if session.0.is_null() {
-            return Err(());
-        }
-        let _ = WinHttpSetTimeouts(session.0, 5000, 5000, 5000, 10_000);
-        let connect = Handle(WinHttpConnect(session.0, w!("lrclib.net"), 443, 0));
-        if connect.0.is_null() {
-            return Err(());
-        }
-        let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-        let request = Handle(WinHttpOpenRequest(
-            connect.0,
-            w!("GET"),
-            PCWSTR(wide_path.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
-        ));
-        if request.0.is_null() {
-            return Err(());
-        }
-        WinHttpSendRequest(request.0, None, None, 0, 0, 0).map_err(|_| ())?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|_| ())?;
-
-        let mut status = 0u32;
-        let mut size = size_of::<u32>() as u32;
-        WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(&mut status as *mut u32 as *mut c_void),
-            &mut size,
-            std::ptr::null_mut(),
-        )
-        .map_err(|_| ())?;
-
-        let mut body = Vec::new();
-        loop {
-            let mut available = 0u32;
-            WinHttpQueryDataAvailable(request.0, &mut available).map_err(|_| ())?;
-            if available == 0 {
-                break;
-            }
-            let mut buf = vec![0u8; available as usize];
-            let mut read = 0u32;
-            WinHttpReadData(request.0, buf.as_mut_ptr() as *mut c_void, available, &mut read).map_err(|_| ())?;
-            body.extend_from_slice(&buf[..read as usize]);
-            if body.len() > 2 * 1024 * 1024 {
-                return Err(());
-            }
-        }
-        Ok((status, String::from_utf8_lossy(&body).into_owned()))
-    }
 }

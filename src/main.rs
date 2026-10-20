@@ -1,7 +1,9 @@
 ﻿#![windows_subsystem = "windows"]
 
+mod http;
 mod lyrics;
 mod media;
+mod spotify;
 mod volume;
 
 use std::cell::RefCell;
@@ -66,6 +68,9 @@ const WM_NOWPLAYING: u32 = WM_APP + 2;
 const CMD_TOGGLE: usize = 1;
 const CMD_QUIT: usize = 2;
 const CMD_AUTOSTART: usize = 3;
+const CMD_SPOTIFY: usize = 4;
+/// Posted by the Spotify Web API worker with a `Box<spotify::Event>` pointer in `lparam`.
+const WM_SPOTIFY: u32 = WM_APP + 5;
 /// Posted by a second launch to make the running instance show itself.
 const WM_SHOW_REQUEST: u32 = WM_APP + 3;
 /// Posted by the lyrics worker with a `Box<lyrics::Lyrics>` pointer in `lparam`.
@@ -325,6 +330,16 @@ fn trim_memory() {
     }
 }
 
+/// Sign in to Spotify, or open the config file first when there is no client ID yet.
+fn start_spotify_sign_in() {
+    if spotify::client_id().is_some() {
+        UI.with_borrow_mut(|ui| ui.notice = Some("Finish signing in in your browser"));
+        spotify::connect();
+    } else {
+        spotify::open_config();
+    }
+}
+
 fn tray_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
@@ -337,6 +352,9 @@ fn tray_menu(hwnd: HWND) {
             CMD_AUTOSTART,
             w!("Start with Windows"),
         );
+        let connected = UI.with_borrow(|ui| ui.spotify_connected);
+        let spotify_label = if connected { w!("Disconnect Spotify") } else { w!("Connect Spotify (like button)") };
+        let _ = AppendMenuW(menu, MF_STRING, CMD_SPOTIFY, spotify_label);
         let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit"));
         let p = cursor();
         // The menu only closes on an outside click if our window is foreground.
@@ -347,6 +365,13 @@ fn tray_menu(hwnd: HWND) {
         match cmd.0 as usize {
             CMD_TOGGLE => toggle_visible(hwnd),
             CMD_AUTOSTART => set_autostart(!auto),
+            CMD_SPOTIFY => {
+                if connected {
+                    spotify::disconnect();
+                } else {
+                    start_spotify_sign_in();
+                }
+            }
             CMD_QUIT => {
                 let _ = DestroyWindow(hwnd);
             }
@@ -357,6 +382,7 @@ fn tray_menu(hwnd: HWND) {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Button {
+    Like,
     Shuffle,
     Prev,
     Toggle,
@@ -431,10 +457,12 @@ fn button_rect(hwnd: HWND, b: Button) -> RECT {
         Button::Mute => row(after_ctrls, after_ctrls + 24),
         Button::Volume => row(after_ctrls + 28, WIDTH - 12),
         Button::Seek => bar_rect(hwnd),
-        // Top-right group, left of the pin.
-        Button::Lyrics => {
+        // Top-right group, left of the pin: lyrics, then the heart.
+        Button::Lyrics | Button::Like => {
             let p = pin_rect(hwnd);
-            RECT { left: p.left - (p.right - p.left), top: p.top, right: p.left, bottom: p.bottom }
+            let w = p.right - p.left;
+            let slot = if b == Button::Lyrics { 1 } else { 2 };
+            RECT { left: p.left - slot * w, top: p.top, right: p.left - (slot - 1) * w, bottom: p.bottom }
         }
         Button::Pin => pin_rect(hwnd),
         Button::Close => close_rect(hwnd),
@@ -451,6 +479,7 @@ fn button_at(hwnd: HWND, p: POINT) -> Option<Button> {
         Button::Mute,
         Button::Volume,
         Button::Seek,
+        Button::Like,
         Button::Lyrics,
         Button::Pin,
         Button::Close,
@@ -522,6 +551,32 @@ fn activate(hwnd: HWND, b: Button) {
             media::command(media::Command::Mute(muted));
             invalidate(hwnd);
         }
+        Button::Like => {
+            let action = UI.with_borrow_mut(|ui| {
+                ui.notice = None;
+                if !ui.spotify_connected {
+                    return None;
+                }
+                match (ui.like, ui.like_id.is_empty()) {
+                    (Some(liked), false) => {
+                        // Flip now; the worker confirms (or reverts) when Spotify answers.
+                        ui.like = Some(!liked);
+                        Some(Some((ui.like_key.clone(), ui.like_id.clone(), !liked)))
+                    }
+                    _ => {
+                        // Unknown (lookup failed or still running): ask again.
+                        ui.like_key.clear();
+                        Some(None)
+                    }
+                }
+            });
+            match action {
+                None => start_spotify_sign_in(),
+                Some(Some((key, id, liked))) => spotify::set_liked(key, id, liked),
+                Some(None) => ensure_like(),
+            }
+            invalidate(hwnd);
+        }
         Button::Lyrics => {
             UI.with_borrow_mut(|ui| {
                 ui.lyrics_open = !ui.lyrics_open;
@@ -536,6 +591,29 @@ fn activate(hwnd: HWND, b: Button) {
             ensure_lyrics();
             save_state(hwnd);
         }
+    }
+}
+
+/// Look up whether the current track is liked, once per track, when signed in.
+fn ensure_like() {
+    let key = UI.with_borrow_mut(|ui| {
+        let key = format!("{}\u{1}{}", ui.title, ui.artist);
+        if !ui.spotify_connected || !ui.active || ui.title.is_empty() {
+            ui.like = None;
+            ui.like_id.clear();
+            ui.like_key.clear();
+            return None;
+        }
+        if ui.like_key == key {
+            return None;
+        }
+        ui.like = None;
+        ui.like_id.clear();
+        ui.like_key = key.clone();
+        Some(key)
+    });
+    if let Some(key) = key {
+        spotify::lookup(key);
     }
 }
 
@@ -624,6 +702,15 @@ struct Ui {
     title: String,
     artist: String,
     album: String,
+    /// Signed in to the Spotify Web API (for the like button).
+    spotify_connected: bool,
+    /// Whether the current track is in Liked Songs, once known.
+    like: Option<bool>,
+    like_id: String,
+    /// Track the like state (or the pending lookup) belongs to.
+    like_key: String,
+    /// A short message shown in place of the artist line until the next click or track.
+    notice: Option<&'static str>,
     lyrics_open: bool,
     lyrics: LyricsView,
     /// Track the lyrics (or the pending request) belong to.
@@ -675,6 +762,11 @@ thread_local! {
             title: String::new(),
             artist: String::new(),
             album: String::new(),
+            spotify_connected: false,
+            like: None,
+            like_id: String::new(),
+            like_key: String::new(),
+            notice: None,
             lyrics_open: false,
             lyrics: LyricsView::Idle,
             lyrics_key: String::new(),
@@ -720,7 +812,7 @@ impl Ui {
             Button::Shuffle => self.can_shuffle,
             Button::Repeat => self.can_repeat,
             Button::Mute | Button::Volume => self.volume >= 0,
-            Button::Lyrics | Button::Pin | Button::Close => true,
+            Button::Like | Button::Lyrics | Button::Pin | Button::Close => true,
         }
     }
 
@@ -896,6 +988,28 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, stat
                     stroke(&[(cx + u * 0.5, cy + u * 0.5), (cx + u * 1.1, cy - u * 0.5)]);
                 } else {
                     stroke(&[(cx + u * 0.55, cy - u * 0.5), (cx + u * 0.9, cy), (cx + u * 0.55, cy + u * 0.5)]);
+                }
+            }
+            Button::Like => {
+                // Heart curve; filled when liked, outline otherwise.
+                let k = u / 15.0;
+                let pts: Vec<POINT> = (0..30)
+                    .map(|i| {
+                        let t = (i as f32 * 12.0).to_radians();
+                        let x = 16.0 * t.sin().powi(3);
+                        let y = -(13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos());
+                        pt(cx + x * k, cy + y * k + u * 0.15)
+                    })
+                    .collect();
+                if state != 0 {
+                    let _ = Polygon(hdc, &pts);
+                } else {
+                    let pen = CreatePen(PS_SOLID, scale(hwnd, 2), color);
+                    let (op, ob) = (SelectObject(hdc, pen.into()), SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+                    let _ = Polygon(hdc, &pts);
+                    SelectObject(hdc, op);
+                    SelectObject(hdc, ob);
+                    let _ = DeleteObject(pen.into());
                 }
             }
             Button::Toggle if playing => {
@@ -1126,7 +1240,12 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         let mut r = RECT { left, top: s(26), right, bottom: s(46) };
         draw_text(hdc, title, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(hdc, artist_font.into());
-        SetTextColor(hdc, COLORREF(pal.artist));
+        // A notice (sign-in progress, errors) replaces the artist line.
+        let (artist, artist_color) = match ui.notice {
+            Some(n) => (n, accent),
+            None => (artist, pal.artist),
+        };
+        SetTextColor(hdc, COLORREF(artist_color));
         let mut r = RECT { left, top: s(46), right, bottom: s(64) };
         draw_text(hdc, artist, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
@@ -1168,6 +1287,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             Button::Next,
             Button::Repeat,
             Button::Mute,
+            Button::Like,
             Button::Lyrics,
         ] {
             let rect = button_rect(hwnd, b);
@@ -1188,8 +1308,12 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             } else if (b == Button::Lyrics && ui.lyrics_open)
                 || (b == Button::Shuffle && ui.shuffle)
                 || (b == Button::Repeat && ui.repeat != 0)
+                || (b == Button::Like && ui.like == Some(true))
             {
                 accent
+            } else if b == Button::Like && !ui.spotify_connected && !hot {
+                // Not signed in: dim until the user connects.
+                pal.pin_off
             } else if hot {
                 pal.icon_hot
             } else if matches!(b, Button::Shuffle | Button::Repeat) {
@@ -1198,6 +1322,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             } else {
                 pal.icon
             };
+            // The filled heart is its own cue; the others get a dot when on.
             let is_on = (b == Button::Lyrics && ui.lyrics_open)
                 || (b == Button::Shuffle && ui.shuffle)
                 || (b == Button::Repeat && ui.repeat != 0);
@@ -1210,6 +1335,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
                 Button::Toggle => ui.playing as i32,
                 Button::Repeat => ui.repeat as i32,
                 Button::Mute => ui.muted as i32,
+                Button::Like => (ui.like == Some(true)) as i32,
                 _ => 0,
             };
             draw_icon(hwnd, hdc, b, &rect, COLORREF(color), state);
@@ -1471,7 +1597,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             sync_timer(hwnd, visible);
             if visible {
                 ensure_lyrics();
+                ensure_like();
             }
+            invalidate(hwnd);
+            LRESULT(0)
+        }
+        WM_SPOTIFY => {
+            let e = unsafe { Box::from_raw(lparam.0 as *mut spotify::Event) };
+            UI.with_borrow_mut(|ui| match *e {
+                spotify::Event::Connected(on) => {
+                    ui.spotify_connected = on;
+                    ui.notice = None;
+                    // Force a fresh lookup (or clear the heart) for the current track.
+                    ui.like_key.clear();
+                }
+                spotify::Event::Liked { key, id, liked } => {
+                    if key == ui.like_key {
+                        ui.like_id = id;
+                        ui.like = liked;
+                    }
+                }
+                spotify::Event::Notice(n) => ui.notice = Some(n),
+            });
+            ensure_like();
             invalidate(hwnd);
             LRESULT(0)
         }
@@ -1644,6 +1792,7 @@ fn main() -> Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         media::spawn(hwnd, WM_NOWPLAYING);
         lyrics::spawn(hwnd, WM_LYRICS);
+        spotify::spawn(hwnd, WM_SPOTIFY);
 
         // Blocks until a message arrives: no timers, no polling.
         let mut msg = MSG::default();

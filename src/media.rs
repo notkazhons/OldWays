@@ -4,7 +4,7 @@
 
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Sender};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Imaging::{
@@ -452,10 +452,21 @@ fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
             post(window, msg, np);
         }
         // Block until the next SMTC event or command; no polling.
-        let mut resend = match rx.recv() {
-            Ok(m) => handle(&manager, m),
-            Err(_) => return Ok(()),
+        // Spotify's audio session can appear a moment after its media session; until it does,
+        // look again every couple of seconds instead of waiting for the next media event.
+        let first_msg = if last.active && last.volume < 0 {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(m) => Some(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => return Ok(()),
+            }
         };
+        let mut resend = first_msg.is_some_and(|m| handle(&manager, m));
         while let Ok(m) = rx.try_recv() {
             resend |= handle(&manager, m);
         }

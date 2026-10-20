@@ -1,4 +1,7 @@
 ﻿//! Dev tool: `lyrics_probe <artist> <title> [album] [seconds]` prints what the widget would show.
+#[path = "../http.rs"]
+#[allow(dead_code)]
+mod http;
 #[path = "../lyrics.rs"]
 #[allow(dead_code)]
 mod lyrics;
