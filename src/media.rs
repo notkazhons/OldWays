@@ -4,6 +4,7 @@
 
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Sender};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Imaging::{
@@ -22,6 +23,13 @@ use windows::core::Result;
 
 /// Album art is decoded once at this square size and scaled to the window when drawn.
 pub const ART_SIZE: i32 = 160;
+
+/// SMTC timestamps are 100 ns ticks; one millisecond is this many.
+const TICKS_PER_MS: i64 = 10_000;
+/// Ticks between 1601-01-01 (SMTC epoch) and 1970-01-01.
+const EPOCH_DIFF_TICKS: i64 = 116_444_736_000_000_000;
+/// A reported position this far from where we expected it counts as a seek.
+const JUMP_MS: i64 = 1500;
 
 pub struct Art {
     /// `ART_SIZE` x `ART_SIZE`, 32 bits per pixel, BGRA.
@@ -47,6 +55,29 @@ pub struct NowPlaying {
     pub can_prev: bool,
     pub can_next: bool,
     pub can_toggle: bool,
+    pub can_seek: bool,
+    /// Track length and the position at the moment this was read, in milliseconds.
+    /// While playing the UI advances the position itself from its own clock.
+    pub dur_ms: i64,
+    pub pos_ms: i64,
+}
+
+impl NowPlaying {
+    fn empty(active: bool) -> Self {
+        Self {
+            active,
+            title: String::new(),
+            artist: String::new(),
+            art: ArtUpdate::Clear,
+            playing: false,
+            can_prev: false,
+            can_next: false,
+            can_toggle: false,
+            can_seek: false,
+            dur_ms: 0,
+            pos_ms: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +85,8 @@ pub enum Command {
     Toggle,
     Next,
     Prev,
+    /// Absolute position in milliseconds.
+    Seek(i64),
 }
 
 enum Msg {
@@ -75,6 +108,7 @@ struct Subscription {
     session: Session,
     media: i64,
     playback: i64,
+    timeline: i64,
 }
 
 impl Subscription {
@@ -89,7 +123,14 @@ impl Subscription {
             let _ = t.send(Msg::Refresh);
             Ok(())
         }))?;
-        Ok(Self { session, media, playback })
+        // Spotify fires this every few seconds while playing; the worker only forwards it to
+        // the UI when the position jumped (a seek), so it costs no redraw.
+        let t = tx.clone();
+        let timeline = session.TimelinePropertiesChanged(&TypedEventHandler::new(move |_, _| {
+            let _ = t.send(Msg::Refresh);
+            Ok(())
+        }))?;
+        Ok(Self { session, media, playback, timeline })
     }
 }
 
@@ -97,6 +138,7 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         let _ = self.session.RemoveMediaPropertiesChanged(self.media);
         let _ = self.session.RemovePlaybackInfoChanged(self.playback);
+        let _ = self.session.RemoveTimelinePropertiesChanged(self.timeline);
     }
 }
 
@@ -166,6 +208,8 @@ struct Key {
     can_prev: bool,
     can_next: bool,
     can_toggle: bool,
+    can_seek: bool,
+    dur_ms: i64,
 }
 
 fn handle(manager: &Manager, msg: Msg) {
@@ -175,10 +219,16 @@ fn handle(manager: &Manager, msg: Msg) {
                 Command::Toggle => session.TryTogglePlayPauseAsync(),
                 Command::Next => session.TrySkipNextAsync(),
                 Command::Prev => session.TrySkipPreviousAsync(),
+                Command::Seek(ms) => session.TryChangePlaybackPositionAsync(ms * TICKS_PER_MS),
             };
             let _ = op.and_then(|o| o.join());
         }
     }
+}
+
+fn now_ticks() -> i64 {
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    (d.as_nanos() / 100) as i64 + EPOCH_DIFF_TICKS
 }
 
 fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
@@ -191,6 +241,19 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
     let can_prev = controls.IsPreviousEnabled()?;
     let can_next = controls.IsNextEnabled()?;
     let can_toggle = controls.IsPlayEnabled()? || controls.IsPauseEnabled()?;
+    let can_seek = controls.IsPlaybackPositionEnabled()?;
+
+    // The reported position is a snapshot taken at LastUpdatedTime; bring it up to now.
+    let tl = session.GetTimelineProperties()?;
+    let start = tl.StartTime()?.Duration;
+    let end = tl.EndTime()?.Duration;
+    let mut pos = tl.Position()?.Duration;
+    let updated = tl.LastUpdatedTime()?.UniversalTime;
+    if playing && updated > EPOCH_DIFF_TICKS {
+        pos += now_ticks() - updated;
+    }
+    let dur_ms = ((end - start) / TICKS_PER_MS).max(0);
+    let pos_ms = ((pos - start) / TICKS_PER_MS).clamp(0, dur_ms);
 
     // Decode art only for a new track, or when it was missing last time.
     let need_art = !last.active || last.title != title || last.artist != artist || !last.has_art;
@@ -199,10 +262,7 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
     } else {
         load_art(&props).map_or(ArtUpdate::Clear, ArtUpdate::Set)
     };
-    let has_art = match art {
-        ArtUpdate::Keep | ArtUpdate::Set(_) => true,
-        ArtUpdate::Clear => false,
-    };
+    let has_art = !matches!(art, ArtUpdate::Clear);
     let key = Key {
         active: true,
         title: title.clone(),
@@ -212,8 +272,23 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
         can_prev,
         can_next,
         can_toggle,
+        can_seek,
+        dur_ms,
     };
-    Ok((NowPlaying { active: true, title, artist, art, playing, can_prev, can_next, can_toggle }, key))
+    let np = NowPlaying {
+        active: true,
+        title,
+        artist,
+        art,
+        playing,
+        can_prev,
+        can_next,
+        can_toggle,
+        can_seek,
+        dur_ms,
+        pos_ms,
+    };
+    Ok((np, key))
 }
 
 fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Result<()> {
@@ -226,6 +301,8 @@ fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
 
     let mut sub: Option<Subscription> = None;
     let mut last = Key::default();
+    // Position the UI is extrapolating from: (ms, when we sent it, was playing).
+    let mut base: Option<(i64, Instant, bool)> = None;
     let mut first = true;
     loop {
         let (np, key) = match find_spotify(&manager)? {
@@ -236,38 +313,24 @@ fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
                 if !same {
                     sub = Some(Subscription::new(session.clone(), &tx)?);
                 }
-                snapshot(&session, &last).unwrap_or_else(|_| {
-                    let empty = NowPlaying {
-                        active: true,
-                        title: String::new(),
-                        artist: String::new(),
-                        art: ArtUpdate::Clear,
-                        playing: false,
-                        can_prev: false,
-                        can_next: false,
-                        can_toggle: false,
-                    };
-                    (empty, Key { active: true, ..Default::default() })
-                })
+                snapshot(&session, &last)
+                    .unwrap_or_else(|_| (NowPlaying::empty(true), Key { active: true, ..Default::default() }))
             }
             None => {
                 sub = None;
-                let empty = NowPlaying {
-                    active: false,
-                    title: String::new(),
-                    artist: String::new(),
-                    art: ArtUpdate::Clear,
-                    playing: false,
-                    can_prev: false,
-                    can_next: false,
-                    can_toggle: false,
-                };
-                (empty, Key::default())
+                (NowPlaying::empty(false), Key::default())
             }
         };
-        if first || last != key {
+
+        // Did the position move somewhere the UI's own clock would not have taken it?
+        let jumped = base.is_some_and(|(pos, at, was_playing)| {
+            let expected = if was_playing { pos + at.elapsed().as_millis() as i64 } else { pos };
+            (np.pos_ms - expected).abs() > JUMP_MS
+        });
+        if first || last != key || jumped {
             first = false;
             last = key;
+            base = Some((np.pos_ms, Instant::now(), np.playing));
             post(window, msg, np);
         }
         // Block until the next SMTC event or command; no polling.

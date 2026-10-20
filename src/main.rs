@@ -5,13 +5,14 @@ mod media;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::time::Instant;
 
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
     DeleteObject, DrawTextW, Ellipse, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject,
     HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, InvalidateRect, NULL_BRUSH, NULL_PEN, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, PS_SOLID, Polygon, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode,
@@ -34,11 +35,11 @@ use windows::core::{PWSTR, Result, w};
 
 /// Logical size in device-independent pixels at 96 DPI.
 const WIDTH: i32 = 320;
-const HEIGHT: i32 = 96;
+const HEIGHT: i32 = 112;
 const MARGIN: i32 = 16;
 const CLOSE_SIZE: i32 = 28;
 /// Album art square and the padding around it.
-const ART: i32 = 80;
+const ART: i32 = 96;
 const PAD: i32 = 8;
 
 /// Tray icon callback message and menu command ids.
@@ -294,14 +295,47 @@ enum Button {
     Prev,
     Toggle,
     Next,
+    Seek,
     Pin,
     Close,
 }
 
-const CTRL_LEFT: i32 = 96;
-const CTRL_TOP: i32 = 66;
+/// Right-hand column, left to right: art, then title / artist / progress row / controls.
+const TEXT_X: i32 = PAD + ART + 12;
+const CTRL_LEFT: i32 = 164;
+const CTRL_TOP: i32 = 84;
 const CTRL_W: i32 = 32;
 const CTRL_H: i32 = 24;
+const BAR_TOP: i32 = 64;
+const BAR_H: i32 = 20;
+/// Width reserved for each time label beside the progress bar.
+const TIME_W: i32 = 34;
+
+/// Clickable progress bar area, taller than the drawn track so it is easy to hit.
+fn bar_rect(hwnd: HWND) -> RECT {
+    RECT {
+        left: scale(hwnd, TEXT_X + TIME_W + 4),
+        top: scale(hwnd, BAR_TOP),
+        right: scale(hwnd, WIDTH - 12 - TIME_W - 4),
+        bottom: scale(hwnd, BAR_TOP + BAR_H),
+    }
+}
+
+/// Position in ms under client x, clamped to the bar.
+fn seek_ms_at(hwnd: HWND, x: i32, dur_ms: i64) -> i64 {
+    let r = bar_rect(hwnd);
+    let frac = ((x - r.left) as f64 / (r.right - r.left).max(1) as f64).clamp(0.0, 1.0);
+    (frac * dur_ms as f64) as i64
+}
+
+fn fmt_time(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
 
 fn button_rect(hwnd: HWND, b: Button) -> RECT {
     let ctrl = |i: i32| RECT {
@@ -314,13 +348,14 @@ fn button_rect(hwnd: HWND, b: Button) -> RECT {
         Button::Prev => ctrl(0),
         Button::Toggle => ctrl(1),
         Button::Next => ctrl(2),
+        Button::Seek => bar_rect(hwnd),
         Button::Pin => pin_rect(hwnd),
         Button::Close => close_rect(hwnd),
     }
 }
 
 fn button_at(hwnd: HWND, p: POINT) -> Option<Button> {
-    [Button::Prev, Button::Toggle, Button::Next, Button::Pin, Button::Close]
+    [Button::Prev, Button::Toggle, Button::Next, Button::Seek, Button::Pin, Button::Close]
         .into_iter()
         .find(|&b| in_rect(&button_rect(hwnd, b), p))
 }
@@ -343,7 +378,27 @@ fn activate(hwnd: HWND, b: Button) {
         Button::Toggle => media::command(media::Command::Toggle),
         Button::Next => media::command(media::Command::Next),
         Button::Prev => media::command(media::Command::Prev),
+        // Seeking is committed on mouse release, not on click.
+        Button::Seek => {}
     }
+}
+
+const TIMER_ID: usize = 1;
+
+/// The once-a-second redraw runs only while a track plays and the window is visible.
+fn sync_timer(hwnd: HWND, visible: bool) {
+    UI.with_borrow_mut(|ui| {
+        let want = visible && ui.playing && ui.dur_ms > 0;
+        unsafe {
+            if want && !ui.timer_on {
+                SetTimer(Some(hwnd), TIMER_ID, 1000, None);
+                ui.timer_on = true;
+            } else if !want && ui.timer_on {
+                let _ = KillTimer(Some(hwnd), TIMER_ID);
+                ui.timer_on = false;
+            }
+        }
+    });
 }
 
 /// What the window shows. Lives on the UI thread; the worker only posts updates.
@@ -356,6 +411,14 @@ struct Ui {
     can_prev: bool,
     can_next: bool,
     can_toggle: bool,
+    can_seek: bool,
+    dur_ms: i64,
+    /// Position reported at `base_at`; the shown position advances from there while playing.
+    base_ms: i64,
+    base_at: Option<Instant>,
+    /// Position being dragged to, while the mouse is down on the progress bar.
+    scrub: Option<i64>,
+    timer_on: bool,
     hover: Option<Button>,
     pressed: Option<Button>,
     /// A WM_MOUSELEAVE request is outstanding.
@@ -364,6 +427,7 @@ struct Ui {
     dpi: u32,
     title_font: Option<HFONT>,
     artist_font: Option<HFONT>,
+    time_font: Option<HFONT>,
 }
 
 thread_local! {
@@ -377,12 +441,19 @@ thread_local! {
             can_prev: false,
             can_next: false,
             can_toggle: false,
+            can_seek: false,
+            dur_ms: 0,
+            base_ms: 0,
+            base_at: None,
+            scrub: None,
+            timer_on: false,
             hover: None,
             pressed: None,
             tracking: false,
             dpi: 0,
             title_font: None,
             artist_font: None,
+            time_font: None,
         })
     };
 }
@@ -393,8 +464,21 @@ impl Ui {
             Button::Prev => self.can_prev,
             Button::Next => self.can_next,
             Button::Toggle => self.can_toggle,
+            Button::Seek => self.can_seek && self.dur_ms > 0,
             Button::Pin | Button::Close => true,
         }
+    }
+
+    /// Current position: the dragged-to spot, else the last report plus time played since.
+    fn position_ms(&self) -> i64 {
+        if let Some(s) = self.scrub {
+            return s;
+        }
+        let ahead = match (self.playing, self.base_at) {
+            (true, Some(at)) => at.elapsed().as_millis() as i64,
+            _ => 0,
+        };
+        (self.base_ms + ahead).clamp(0, self.dur_ms.max(0))
     }
 
     fn update(&mut self, np: media::NowPlaying) {
@@ -405,6 +489,10 @@ impl Ui {
         self.can_prev = np.can_prev;
         self.can_next = np.can_next;
         self.can_toggle = np.can_toggle;
+        self.can_seek = np.can_seek;
+        self.dur_ms = np.dur_ms;
+        self.base_ms = np.pos_ms;
+        self.base_at = Some(Instant::now());
         // Same track (e.g. just paused): keep the bitmap we already have.
         let new_art = match np.art {
             media::ArtUpdate::Keep => return,
@@ -422,7 +510,10 @@ impl Ui {
     }
 
     fn free_fonts(&mut self) {
-        for f in [self.title_font.take(), self.artist_font.take()].into_iter().flatten() {
+        for f in [self.title_font.take(), self.artist_font.take(), self.time_font.take()]
+            .into_iter()
+            .flatten()
+        {
             unsafe {
                 let _ = DeleteObject(f.into());
             }
@@ -439,7 +530,7 @@ impl Ui {
     }
 
     /// Fonts are rebuilt only when the DPI changes.
-    fn fonts(&mut self, hwnd: HWND) -> (HFONT, HFONT) {
+    fn fonts(&mut self, hwnd: HWND) -> (HFONT, HFONT, HFONT) {
         let dpi = unsafe { GetDpiForWindow(hwnd) };
         if dpi != self.dpi || self.title_font.is_none() {
             self.free_fonts();
@@ -464,8 +555,9 @@ impl Ui {
             };
             self.title_font = Some(make(15, FW_SEMIBOLD.0 as i32));
             self.artist_font = Some(make(13, FW_NORMAL.0 as i32));
+            self.time_font = Some(make(11, FW_NORMAL.0 as i32));
         }
-        (self.title_font.unwrap(), self.artist_font.unwrap())
+        (self.title_font.unwrap(), self.artist_font.unwrap(), self.time_font.unwrap())
     }
 }
 
@@ -511,8 +603,21 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, play
                 );
                 fill(hdc, brush, cx - u * 0.95, cy - u * 0.8, cx - u * 0.6, cy + u * 0.8);
             }
-            Button::Pin | Button::Close => {}
+            Button::Seek | Button::Pin | Button::Close => {}
         }
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+/// Rounded rectangle in a solid color, no outline.
+fn fill_round(hdc: HDC, l: i32, t: i32, r: i32, b: i32, radius: i32, color: u32) {
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF(color));
+        let old_brush = SelectObject(hdc, brush.into());
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let _ = RoundRect(hdc, l, t, r, b, radius, radius);
         SelectObject(hdc, old_pen);
         SelectObject(hdc, old_brush);
         let _ = DeleteObject(brush.into());
@@ -536,7 +641,7 @@ fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, flags: DRAW_TEXT_FORMAT) {
 
 fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
     UI.with_borrow_mut(|ui| unsafe {
-        let (title_font, artist_font) = ui.fonts(hwnd);
+        let (title_font, artist_font, time_font) = ui.fonts(hwnd);
         let s = |v| scale(hwnd, v);
 
         let bg = CreateSolidBrush(COLORREF(0x00201C1A));
@@ -586,7 +691,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         } else {
             (ui.title.as_str(), ui.artist.as_str())
         };
-        let left = s(PAD + ART + 12);
+        let left = s(TEXT_X);
         let right = s(WIDTH - 12);
         SelectObject(hdc, title_font.into());
         SetTextColor(hdc, COLORREF(0x00F0F0F0));
@@ -596,6 +701,36 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         SetTextColor(hdc, COLORREF(0x00A0A0A0));
         let mut r = RECT { left, top: s(46), right, bottom: s(64) };
         draw_text(hdc, artist, &mut r, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        // Progress bar with elapsed and total time.
+        if ui.dur_ms > 0 {
+            let bar = button_rect(hwnd, Button::Seek);
+            let can = ui.enabled(Button::Seek);
+            let hot = can && (ui.hover == Some(Button::Seek) || ui.pressed == Some(Button::Seek));
+            let (pos, dur) = (ui.position_ms(), ui.dur_ms);
+            let width = bar.right - bar.left;
+            let filled = (width as f64 * pos as f64 / dur as f64) as i32;
+            let th = s(if hot { 6 } else { 4 });
+            let cy = (bar.top + bar.bottom) / 2;
+            let (y0, y1) = (cy - th / 2, cy - th / 2 + th);
+            fill_round(hdc, bar.left, y0, bar.right, y1, th, 0x004A4540);
+            if filled > 0 {
+                let color = if can { 0x00D0D0D0 } else { 0x00707070 };
+                fill_round(hdc, bar.left, y0, bar.left + filled.max(th), y1, th, color);
+            }
+            if hot {
+                let d = s(12);
+                let x = bar.left + filled;
+                fill_round(hdc, x - d / 2, cy - d / 2, x + d / 2, cy + d / 2, d, 0x00FFFFFF);
+            }
+
+            SelectObject(hdc, time_font.into());
+            SetTextColor(hdc, COLORREF(0x00909090));
+            let mut r = RECT { left: s(TEXT_X), top: bar.top, right: s(TEXT_X + TIME_W), bottom: bar.bottom };
+            draw_text(hdc, &fmt_time(pos), &mut r, DT_RIGHT | DT_VCENTER);
+            let mut r = RECT { left: bar.right + s(4), top: bar.top, right: s(WIDTH - 8), bottom: bar.bottom };
+            draw_text(hdc, &fmt_time(dur), &mut r, DT_LEFT | DT_VCENTER);
+        }
 
         // Transport buttons.
         for b in [Button::Prev, Button::Toggle, Button::Next] {
@@ -653,8 +788,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_MOUSEMOVE => {
             let b = button_at(hwnd, client_point(lparam));
             let arm = UI.with_borrow_mut(|ui| {
-                let changed = ui.hover != b;
+                let mut changed = ui.hover != b;
                 ui.hover = b;
+                if ui.pressed == Some(Button::Seek) {
+                    ui.scrub = Some(seek_ms_at(hwnd, client_point(lparam).x, ui.dur_ms));
+                    changed = true;
+                }
                 let arm = !ui.tracking;
                 ui.tracking = true;
                 if changed {
@@ -686,7 +825,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONDOWN => {
             if let Some(b) = button_at(hwnd, client_point(lparam)) {
                 if UI.with_borrow(|ui| ui.enabled(b)) {
-                    UI.with_borrow_mut(|ui| ui.pressed = Some(b));
+                    UI.with_borrow_mut(|ui| {
+                        ui.pressed = Some(b);
+                        if b == Button::Seek {
+                            ui.scrub = Some(seek_ms_at(hwnd, client_point(lparam).x, ui.dur_ms));
+                        }
+                    });
                     unsafe {
                         SetCapture(hwnd);
                     }
@@ -700,10 +844,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 unsafe {
                     let _ = ReleaseCapture();
                 }
-                invalidate(hwnd);
-                if button_at(hwnd, client_point(lparam)) == Some(pressed) {
+                if pressed == Button::Seek {
+                    // Commit the drag: jump there now and tell Spotify.
+                    let target = UI.with_borrow_mut(|ui| {
+                        let t = ui.scrub.take();
+                        if let Some(ms) = t {
+                            ui.base_ms = ms;
+                            ui.base_at = Some(Instant::now());
+                        }
+                        t
+                    });
+                    if let Some(ms) = target {
+                        media::command(media::Command::Seek(ms));
+                    }
+                } else if button_at(hwnd, client_point(lparam)) == Some(pressed) {
                     activate(hwnd, pressed);
                 }
+                invalidate(hwnd);
             }
             LRESULT(0)
         }
@@ -766,10 +923,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // Ownership of the box passes from the worker thread to us.
             let np = unsafe { Box::from_raw(lparam.0 as *mut media::NowPlaying) };
             UI.with_borrow_mut(|ui| ui.update(*np));
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
+            sync_timer(hwnd, unsafe { IsWindowVisible(hwnd) }.as_bool());
+            invalidate(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == TIMER_ID {
+                invalidate(hwnd);
             }
             LRESULT(0)
+        }
+        WM_SHOWWINDOW => {
+            sync_timer(hwnd, wparam.0 != 0);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_TRAY => {
             match lparam.0 as u32 {
