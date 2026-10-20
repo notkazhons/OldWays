@@ -1201,9 +1201,9 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, stat
                 // is a U with a round closed end, one long arm and one short arm; the long arm of
                 // one runs past the middle on the side where the other's arm is short, so the two
                 // never touch.
-                let r = u * 0.5;
+                let r = u * 0.4;
                 let off = 0.0;
-                let (long, short, back) = (u * 1.15, u * 0.55, u * 1.0);
+                let (long, short, back) = (u * 0.92, u * 0.44, u * 0.8);
                 let (c45, s45) = ((-45f32).to_radians().cos(), (-45f32).to_radians().sin());
                 for flip in [1.0f32, -1.0] {
                     // Link-local: closed end centered at x = -back, arms run toward +x.
