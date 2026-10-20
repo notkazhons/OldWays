@@ -405,13 +405,18 @@ impl Ui {
         self.can_prev = np.can_prev;
         self.can_next = np.can_next;
         self.can_toggle = np.can_toggle;
-        // The previous bitmap is always replaced: a new track without art clears it.
+        // Same track (e.g. just paused): keep the bitmap we already have.
+        let new_art = match np.art {
+            media::ArtUpdate::Keep => return,
+            media::ArtUpdate::Set(a) => Some(a),
+            media::ArtUpdate::Clear => None,
+        };
         if let Some(old) = self.art.take() {
             unsafe {
                 let _ = DeleteObject(old.into());
             }
         }
-        self.art = np.art.map(|a| unsafe {
+        self.art = new_art.map(|a| unsafe {
             CreateBitmap(media::ART_SIZE, media::ART_SIZE, 1, 32, Some(a.bgra.as_ptr() as *const _))
         });
     }

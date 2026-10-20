@@ -1,4 +1,4 @@
-//! Spotify now-playing state from Windows media controls (SMTC), read on a worker thread.
+﻿//! Spotify now-playing state from Windows media controls (SMTC), read on a worker thread.
 //! The thread sleeps on a channel; SMTC events and UI commands wake it. It posts a `NowPlaying`
 //! to the window only when something the UI shows has changed.
 
@@ -28,12 +28,21 @@ pub struct Art {
     pub bgra: Vec<u8>,
 }
 
+/// What to do with the bitmap the UI already holds.
+pub enum ArtUpdate {
+    /// Same track: keep the current art.
+    Keep,
+    Set(Art),
+    /// New track or no session without art: show the placeholder.
+    Clear,
+}
+
 pub struct NowPlaying {
     /// A Spotify session exists.
     pub active: bool,
     pub title: String,
     pub artist: String,
-    pub art: Option<Art>,
+    pub art: ArtUpdate,
     pub playing: bool,
     pub can_prev: bool,
     pub can_next: bool,
@@ -185,8 +194,15 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
 
     // Decode art only for a new track, or when it was missing last time.
     let need_art = !last.active || last.title != title || last.artist != artist || !last.has_art;
-    let art = if need_art { load_art(&props) } else { None };
-    let has_art = if need_art { art.is_some() } else { true };
+    let art = if !need_art {
+        ArtUpdate::Keep
+    } else {
+        load_art(&props).map_or(ArtUpdate::Clear, ArtUpdate::Set)
+    };
+    let has_art = match art {
+        ArtUpdate::Keep | ArtUpdate::Set(_) => true,
+        ArtUpdate::Clear => false,
+    };
     let key = Key {
         active: true,
         title: title.clone(),
@@ -225,7 +241,7 @@ fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
                         active: true,
                         title: String::new(),
                         artist: String::new(),
-                        art: None,
+                        art: ArtUpdate::Clear,
                         playing: false,
                         can_prev: false,
                         can_next: false,
@@ -240,7 +256,7 @@ fn run(window: isize, msg: u32, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
                     active: false,
                     title: String::new(),
                     artist: String::new(),
-                    art: None,
+                    art: ArtUpdate::Clear,
                     playing: false,
                     can_prev: false,
                     can_next: false,
