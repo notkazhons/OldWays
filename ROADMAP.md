@@ -31,12 +31,12 @@ Goal: control placement and visibility without a taskbar button.
 - [x] A normal window still stays visible after Win+D and stays behind apps (tested), so no desktop-layer attach is needed. Attaching as a child of the desktop view was tried and dropped: Windows rescaled its position under 125% display scaling and it drew nothing.
 - [x] Tray icon: left click hides or shows, right click menu has Hide/Show and Quit. Icon is re-added after an Explorer restart.
 - [x] Placement and mode are restored on launch.
-## S4: Show now playing (doing)
+## S4: Show now playing (done)
 Goal: draw track info in the window.
-- [ ] Title and artist text, truncated with ellipsis when too long.
+- [x] Title and artist text, truncated with ellipsis when too long.
 - [x] Album art loaded from the SMTC thumbnail, scaled to the window, freed on track change.
 - [x] Updates on SMTC events only.
-- [ ] Empty state when Spotify is not running.
+- [x] Empty state when Spotify is not running.
 
 ## S5: Transport controls (todo)
 Goal: control playback from the widget.

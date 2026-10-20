@@ -380,6 +380,10 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, flags: DRAW_TEXT_FORMAT) {
+    // DrawTextW faults on a zero-length buffer (empty artist while Spotify shuts down).
+    if s.is_empty() {
+        return;
+    }
     let mut buf = wide(s);
     unsafe {
         DrawTextW(hdc, &mut buf, rect, flags | DT_NOPREFIX | DT_SINGLELINE);
