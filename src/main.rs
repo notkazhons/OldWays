@@ -1192,9 +1192,20 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
                 accent
             } else if hot {
                 pal.icon_hot
+            } else if matches!(b, Button::Shuffle | Button::Repeat) {
+                // Off reads clearly dimmer than the other buttons.
+                pal.pin_off
             } else {
                 pal.icon
             };
+            let is_on = (b == Button::Lyrics && ui.lyrics_open)
+                || (b == Button::Shuffle && ui.shuffle)
+                || (b == Button::Repeat && ui.repeat != 0);
+            if is_on {
+                // Small dot under the icon, as a second cue besides the accent color.
+                let (d, cx) = (s(4), (rect.left + rect.right) / 2);
+                fill_round(hdc, cx - d / 2, rect.bottom - d - s(1), cx + d / 2, rect.bottom - s(1), d, accent);
+            }
             let state = match b {
                 Button::Toggle => ui.playing as i32,
                 Button::Repeat => ui.repeat as i32,
