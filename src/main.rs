@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmGetColorizationColor, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
+    AC_SRC_OVER, AlphaBlend, BLENDFUNCTION, CreateRoundRectRgn, RestoreDC, SaveDC, SelectClipRgn,
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, DIB_RGB_COLORS, StretchDIBits, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
@@ -1307,6 +1308,29 @@ fn fill_round(hdc: HDC, l: i32, t: i32, r: i32, b: i32, radius: i32, color: u32)
     }
 }
 
+/// Rounded box filled with `color` at `alpha` / 255, so what is behind it shows through.
+fn fill_round_alpha(hdc: HDC, l: i32, t: i32, r: i32, b: i32, radius: i32, color: u32, alpha: u8) {
+    unsafe {
+        let saved = SaveDC(hdc);
+        let rgn = CreateRoundRectRgn(l, t, r + 1, b + 1, radius, radius);
+        SelectClipRgn(hdc, Some(rgn));
+        // A 1x1 bitmap of the color, stretched over the box by AlphaBlend.
+        let src = CreateCompatibleDC(Some(hdc));
+        let bmp = CreateCompatibleBitmap(hdc, 1, 1);
+        let old = SelectObject(src, bmp.into());
+        let brush = CreateSolidBrush(COLORREF(color));
+        FillRect(src, &RECT { left: 0, top: 0, right: 1, bottom: 1 }, brush);
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: 0 };
+        let _ = AlphaBlend(hdc, l, t, r - l, b - t, src, 0, 0, 1, 1, blend);
+        let _ = DeleteObject(brush.into());
+        SelectObject(src, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(src);
+        let _ = RestoreDC(hdc, saved);
+        let _ = DeleteObject(rgn.into());
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
@@ -1516,7 +1540,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
                 right: s(width() - PAD),
                 bottom: s(HEIGHT + LYRICS_H - PAD),
             };
-            fill_round(hdc, bx.left, bx.top, bx.right, bx.bottom, s(10), pal.art_bg);
+            fill_round_alpha(hdc, bx.left, bx.top, bx.right, bx.bottom, s(10), pal.art_bg, 128);
             let line_h = s(LYRIC_LINE_H);
             let top = bx.top + (bx.bottom - bx.top - line_h * LYRIC_LINES) / 2;
             let (lx, rx) = (bx.left + s(10), bx.right - s(10));

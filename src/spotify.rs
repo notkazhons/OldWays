@@ -27,7 +27,7 @@ use crate::http;
 const API_HOST: &str = "api.spotify.com";
 const ACCOUNTS_HOST: &str = "accounts.spotify.com";
 const REDIRECT_URI: &str = "http://127.0.0.1:8888/callback";
-const SCOPES: &str = "user-library-read user-library-modify";
+const SCOPES: &str = "user-library-read user-library-modify user-read-currently-playing";
 
 pub enum Event {
     /// Signed in (a refresh token is stored) or not.
@@ -99,6 +99,15 @@ pub fn open_config() {
         );
     }
     open(&path.display().to_string());
+}
+
+/// Append a line to `spotify.log` next to the config. Holds statuses and Spotify's error text
+/// only, never tokens, so a user can attach it to a bug report.
+fn log(line: &str) {
+    let Some(dir) = config_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("spotify.log")) {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 fn open(target: &str) {
@@ -265,7 +274,13 @@ fn token_request(form: String) -> Result<(String, Option<String>, i64), Failure>
         "Content-Type: application/x-www-form-urlencoded\r\n",
         form.as_bytes(),
     )
-    .map_err(|_| Failure::Other("Couldn't reach Spotify"))?;
+    .map_err(|_| {
+        log("token request: could not reach accounts.spotify.com");
+        Failure::Other("Couldn't reach Spotify")
+    })?;
+    if r.status != 200 {
+        log(&format!("token request: {} {}", r.status, r.body.chars().take(200).collect::<String>()));
+    }
     if r.status == 400 || r.status == 401 {
         return Err(Failure::Unauthorized);
     }
@@ -388,6 +403,9 @@ fn api(auth: &mut Auth, method: &str, path: &str, body: &str) -> Result<http::Re
     let headers = format!("Authorization: Bearer {token}\r\nContent-Type: application/json\r\n");
     let r = http::request(method, API_HOST, path, &headers, body.as_bytes())
         .map_err(|_| Failure::Other("Couldn't reach Spotify"))?;
+    if r.status / 100 != 2 {
+        log(&format!("{method} {} -> {} {}", path.split('?').next().unwrap_or(path), r.status, r.body.chars().take(200).collect::<String>()));
+    }
     if r.status == 401 {
         // Token revoked early: drop it and try once with a fresh one.
         auth.access = None;
