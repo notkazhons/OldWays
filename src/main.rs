@@ -1197,21 +1197,30 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, stat
                 }
             }
             Button::Copy => {
-                // Two interlocked chain links, running bottom-left to top-right.
-                let (h, r) = (u * 0.45, u * 0.42);
-                let (cos_t, sin_t) = ((-45f32).to_radians().cos(), (-45f32).to_radians().sin());
-                for off in [-0.62 * u, 0.62 * u] {
-                    let (ox, oy) = (cx + off * cos_t, cy + off * sin_t);
-                    // Stadium outline in link-local coordinates: a half circle at each end.
-                    let mut pts = Vec::new();
-                    for (end, from) in [(h, -90.0f32), (-h, 90.0)] {
-                        for k in 0..=8 {
-                            let a = (from + k as f32 * 22.5).to_radians();
-                            let (x, y) = (end + r * a.cos(), r * a.sin());
-                            pts.push((ox + x * cos_t - y * sin_t, oy + x * sin_t + y * cos_t));
-                        }
+                // Two open chain links on one diagonal, the second a half turn from the first. Each
+                // is a U with a round closed end, one long arm and one short arm; the long arm of
+                // one runs past the middle on the side where the other's arm is short, so the two
+                // never touch.
+                let r = u * 0.5;
+                let off = 0.0;
+                let (long, short, back) = (u * 1.15, u * 0.55, u * 1.0);
+                let (c45, s45) = ((-45f32).to_radians().cos(), (-45f32).to_radians().sin());
+                for flip in [1.0f32, -1.0] {
+                    // Link-local: closed end centered at x = -back, arms run toward +x.
+                    let mut pts = vec![(-back + short, off + r), (-back, off + r)];
+                    for k in 1..8 {
+                        let a = (90.0 + k as f32 * 22.5).to_radians();
+                        pts.push((-back + r * a.cos(), off + r * a.sin()));
                     }
-                    pts.push(pts[0]);
+                    pts.push((-back, off - r));
+                    pts.push((-back + long, off - r));
+                    let pts: Vec<(f32, f32)> = pts
+                        .iter()
+                        .map(|&(x, y)| {
+                            let (x, y) = (x * flip, y * flip);
+                            (cx + x * c45 - y * s45, cy + x * s45 + y * c45)
+                        })
+                        .collect();
                     stroke(&pts);
                 }
             }
