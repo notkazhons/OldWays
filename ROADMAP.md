@@ -65,12 +65,13 @@ Goal: stay out of the way.
 - [x] Single instance only.
 - [x] Hide to tray frees the album art bitmap.
 
-## S9: Spotify Web API extras, optional (todo)
-Goal: controls SMTC cannot do. Requires Premium and a one-time login.
-- [ ] OAuth with PKCE, refresh token stored in Windows Credential Manager.
-- [ ] Volume, shuffle, repeat, like.
+## S9: Shuffle, repeat, volume, like (doing)
+Goal: the extras the media session does not cover in the original plan. Spotify exposes shuffle and repeat through the Windows media session, and its audio level through the Windows volume mixer, so most of this needs no login.
+- [x] Shuffle button: dot-free icon, accent color when on. Uses the media session.
+- [x] Repeat button cycles off, list, track. Uses the media session.
+- [x] Speaker button mutes; slider sets Spotify's level in the Windows volume mixer (separate from the slider inside Spotify).
+- [ ] Like button (needs the Spotify Web API): OAuth with PKCE against a Spotify developer app (client id from the user), refresh token in Windows Credential Manager. Not started.
 - [ ] No extra network traffic or memory when the user has not logged in.
-
 ## S11: Lyrics box (doing)
 Goal: a toggle shows a small box with the lyrics of the current track.
 - [x] Source: LRCLIB (lrclib.net), free public API, no key. The request sends artist, title, album and duration to that server. Synced lines when available, plain text as fallback, a short message when nothing is found.

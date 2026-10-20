@@ -2,6 +2,7 @@
 
 mod lyrics;
 mod media;
+mod volume;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -21,8 +22,8 @@ use windows::Win32::Graphics::Gdi::{
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
     DeleteObject, DrawTextW, Ellipse, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject,
     HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, InvalidateRect, NULL_BRUSH, NULL_PEN, OUT_DEFAULT_PRECIS,
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, PS_SOLID,
-    Polygon, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode,
+    GetMonitorInfoW, LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, MoveToEx,
+    PAINTSTRUCT, PS_SOLID, Polygon, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode,
     SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -46,7 +47,7 @@ use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProc
 use windows::core::{BOOL, PCWSTR, PWSTR, Result, w};
 
 /// Logical size in device-independent pixels at 96 DPI.
-const WIDTH: i32 = 320;
+const WIDTH: i32 = 360;
 const HEIGHT: i32 = 112;
 /// Extra height while the lyrics box is open.
 const LYRICS_H: i32 = 100;
@@ -356,9 +357,13 @@ fn tray_menu(hwnd: HWND) {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Button {
+    Shuffle,
     Prev,
     Toggle,
     Next,
+    Repeat,
+    Mute,
+    Volume,
     Seek,
     Lyrics,
     Pin,
@@ -366,10 +371,11 @@ enum Button {
 }
 
 /// Right-hand column, left to right: art, then title / artist / progress row / controls.
+/// Controls row: shuffle, previous, play/pause, next, repeat, then speaker and volume slider.
 const TEXT_X: i32 = PAD + ART + 12;
-const CTRL_LEFT: i32 = 164;
+const CTRL_LEFT: i32 = TEXT_X;
 const CTRL_TOP: i32 = 84;
-const CTRL_W: i32 = 32;
+const CTRL_W: i32 = 28;
 const CTRL_H: i32 = 24;
 const BAR_TOP: i32 = 64;
 const BAR_H: i32 = 20;
@@ -409,27 +415,68 @@ fn button_rect(hwnd: HWND, b: Button) -> RECT {
         right: scale(hwnd, CTRL_LEFT + (i + 1) * CTRL_W),
         bottom: scale(hwnd, CTRL_TOP + CTRL_H),
     };
+    let row = |l: i32, r: i32| RECT {
+        left: scale(hwnd, l),
+        top: scale(hwnd, CTRL_TOP),
+        right: scale(hwnd, r),
+        bottom: scale(hwnd, CTRL_TOP + CTRL_H),
+    };
+    let after_ctrls = CTRL_LEFT + 5 * CTRL_W + 8;
     match b {
-        Button::Prev => ctrl(0),
-        Button::Toggle => ctrl(1),
-        Button::Next => ctrl(2),
+        Button::Shuffle => ctrl(0),
+        Button::Prev => ctrl(1),
+        Button::Toggle => ctrl(2),
+        Button::Next => ctrl(3),
+        Button::Repeat => ctrl(4),
+        Button::Mute => row(after_ctrls, after_ctrls + 24),
+        Button::Volume => row(after_ctrls + 28, WIDTH - 12),
         Button::Seek => bar_rect(hwnd),
-        // Right of the transport buttons, with a small gap.
-        Button::Lyrics => RECT {
-            left: scale(hwnd, CTRL_LEFT + 3 * CTRL_W + 10),
-            top: scale(hwnd, CTRL_TOP),
-            right: scale(hwnd, CTRL_LEFT + 4 * CTRL_W + 10),
-            bottom: scale(hwnd, CTRL_TOP + CTRL_H),
-        },
+        // Top-right group, left of the pin.
+        Button::Lyrics => {
+            let p = pin_rect(hwnd);
+            RECT { left: p.left - (p.right - p.left), top: p.top, right: p.left, bottom: p.bottom }
+        }
         Button::Pin => pin_rect(hwnd),
         Button::Close => close_rect(hwnd),
     }
 }
 
 fn button_at(hwnd: HWND, p: POINT) -> Option<Button> {
-    [Button::Prev, Button::Toggle, Button::Next, Button::Seek, Button::Lyrics, Button::Pin, Button::Close]
-        .into_iter()
-        .find(|&b| in_rect(&button_rect(hwnd, b), p))
+    [
+        Button::Shuffle,
+        Button::Prev,
+        Button::Toggle,
+        Button::Next,
+        Button::Repeat,
+        Button::Mute,
+        Button::Volume,
+        Button::Seek,
+        Button::Lyrics,
+        Button::Pin,
+        Button::Close,
+    ]
+    .into_iter()
+    .find(|&b| in_rect(&button_rect(hwnd, b), p))
+}
+
+/// Volume percent under client x on the slider.
+fn volume_at(hwnd: HWND, x: i32) -> i32 {
+    let r = button_rect(hwnd, Button::Volume);
+    let frac = ((x - r.left) as f64 / (r.right - r.left).max(1) as f64).clamp(0.0, 1.0);
+    (frac * 100.0).round() as i32
+}
+
+/// Move the volume to the slider position under `x`, unmuting, and tell the worker.
+fn set_volume_from(hwnd: HWND, ui: &mut Ui, x: i32) {
+    let v = volume_at(hwnd, x);
+    if v != ui.volume || ui.muted {
+        ui.volume = v;
+        if ui.muted {
+            ui.muted = false;
+            media::command(media::Command::Mute(false));
+        }
+        media::command(media::Command::Volume(v));
+    }
 }
 
 fn invalidate(hwnd: HWND) {
@@ -452,6 +499,29 @@ fn activate(hwnd: HWND, b: Button) {
         Button::Prev => media::command(media::Command::Prev),
         // Seeking is committed on mouse release, not on click.
         Button::Seek => {}
+        // The volume slider acts while dragging (see WM_MOUSEMOVE).
+        Button::Volume => {}
+        Button::Shuffle => {
+            let on = UI.with_borrow(|ui| ui.shuffle);
+            media::command(media::Command::Shuffle(!on));
+        }
+        Button::Repeat => {
+            // Off, then repeat the list, then repeat the track.
+            let mode = UI.with_borrow(|ui| ui.repeat);
+            media::command(media::Command::Repeat(match mode {
+                0 => 2,
+                2 => 1,
+                _ => 0,
+            }));
+        }
+        Button::Mute => {
+            let muted = UI.with_borrow_mut(|ui| {
+                ui.muted = !ui.muted;
+                ui.muted
+            });
+            media::command(media::Command::Mute(muted));
+            invalidate(hwnd);
+        }
         Button::Lyrics => {
             UI.with_borrow_mut(|ui| {
                 ui.lyrics_open = !ui.lyrics_open;
@@ -566,6 +636,14 @@ struct Ui {
     can_next: bool,
     can_toggle: bool,
     can_seek: bool,
+    can_shuffle: bool,
+    can_repeat: bool,
+    shuffle: bool,
+    /// 0 off, 1 repeat the track, 2 repeat the list.
+    repeat: u8,
+    /// Spotify's mixer volume 0..=100, or -1 when it has no audio session.
+    volume: i32,
+    muted: bool,
     dur_ms: i64,
     /// Position reported at `base_at`; the shown position advances from there while playing.
     base_ms: i64,
@@ -607,6 +685,12 @@ thread_local! {
             can_next: false,
             can_toggle: false,
             can_seek: false,
+            can_shuffle: false,
+            can_repeat: false,
+            shuffle: false,
+            repeat: 0,
+            volume: -1,
+            muted: false,
             dur_ms: 0,
             base_ms: 0,
             base_at: None,
@@ -633,6 +717,9 @@ impl Ui {
             Button::Next => self.can_next,
             Button::Toggle => self.can_toggle,
             Button::Seek => self.can_seek && self.dur_ms > 0,
+            Button::Shuffle => self.can_shuffle,
+            Button::Repeat => self.can_repeat,
+            Button::Mute | Button::Volume => self.volume >= 0,
             Button::Lyrics | Button::Pin | Button::Close => true,
         }
     }
@@ -668,6 +755,15 @@ impl Ui {
         self.can_next = np.can_next;
         self.can_toggle = np.can_toggle;
         self.can_seek = np.can_seek;
+        self.can_shuffle = np.can_shuffle;
+        self.can_repeat = np.can_repeat;
+        self.shuffle = np.shuffle;
+        self.repeat = np.repeat;
+        // Do not fight the slider while it is being dragged.
+        if self.pressed != Some(Button::Volume) {
+            self.volume = np.volume;
+        }
+        self.muted = np.muted;
         self.dur_ms = np.dur_ms;
         self.base_ms = np.pos_ms;
         self.base_at = Some(Instant::now());
@@ -750,15 +846,58 @@ fn fill(hdc: HDC, brush: HBRUSH, l: f32, t: f32, r: f32, b: f32) {
     }
 }
 
-/// Play/pause, next and previous glyphs, drawn from polygons and bars.
-fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, playing: bool) {
+/// Button glyphs drawn from polygons, bars and strokes. `state` is: playing for the play/pause
+/// button, the repeat mode (0 off, 1 track, 2 list), or muted for the speaker.
+fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, state: i32) {
+    let playing = state != 0;
     let (cx, cy) = ((rect.left + rect.right) as f32 / 2.0, (rect.top + rect.bottom) as f32 / 2.0);
     let u = scale(hwnd, 7) as f32;
+    // A polyline in the icon color, 2 logical px wide.
+    let stroke = |pts: &[(f32, f32)]| unsafe {
+        let pen = CreatePen(PS_SOLID, scale(hwnd, 2), color);
+        let old = SelectObject(hdc, pen.into());
+        let _ = MoveToEx(hdc, pts[0].0.round() as i32, pts[0].1.round() as i32, None);
+        for p in &pts[1..] {
+            let _ = LineTo(hdc, p.0.round() as i32, p.1.round() as i32);
+        }
+        SelectObject(hdc, old);
+        let _ = DeleteObject(pen.into());
+    };
     unsafe {
         let brush = CreateSolidBrush(color);
         let old_brush = SelectObject(hdc, brush.into());
         let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
         match b {
+            Button::Shuffle => {
+                stroke(&[(cx - u, cy - u * 0.6), (cx - u * 0.2, cy - u * 0.6), (cx + u * 0.3, cy + u * 0.6), (cx + u * 0.7, cy + u * 0.6)]);
+                stroke(&[(cx - u, cy + u * 0.6), (cx - u * 0.2, cy + u * 0.6), (cx + u * 0.3, cy - u * 0.6), (cx + u * 0.7, cy - u * 0.6)]);
+                let _ = Polygon(hdc, &[pt(cx + u * 0.6, cy + u * 0.25), pt(cx + u * 0.6, cy + u * 0.95), pt(cx + u * 1.05, cy + u * 0.6)]);
+                let _ = Polygon(hdc, &[pt(cx + u * 0.6, cy - u * 0.95), pt(cx + u * 0.6, cy - u * 0.25), pt(cx + u * 1.05, cy - u * 0.6)]);
+            }
+            Button::Repeat => {
+                stroke(&[(cx + u * 0.9, cy - u * 0.1), (cx + u * 0.9, cy - u * 0.7), (cx - u * 0.6, cy - u * 0.7), (cx - u * 0.6, cy - u * 0.2)]);
+                stroke(&[(cx - u * 0.9, cy + u * 0.1), (cx - u * 0.9, cy + u * 0.7), (cx + u * 0.6, cy + u * 0.7), (cx + u * 0.6, cy + u * 0.2)]);
+                let _ = Polygon(hdc, &[pt(cx - u * 0.95, cy - u * 0.25), pt(cx - u * 0.25, cy - u * 0.25), pt(cx - u * 0.6, cy + u * 0.3)]);
+                let _ = Polygon(hdc, &[pt(cx + u * 0.95, cy + u * 0.25), pt(cx + u * 0.25, cy + u * 0.25), pt(cx + u * 0.6, cy - u * 0.3)]);
+                if state == 1 {
+                    // A small "1" in the middle marks repeat-one.
+                    fill(hdc, brush, cx - u * 0.1, cy - u * 0.4, cx + u * 0.15, cy + u * 0.4);
+                    fill(hdc, brush, cx - u * 0.35, cy - u * 0.4, cx - u * 0.1, cy - u * 0.2);
+                }
+            }
+            Button::Mute => {
+                fill(hdc, brush, cx - u, cy - u * 0.35, cx - u * 0.4, cy + u * 0.35);
+                let _ = Polygon(
+                    hdc,
+                    &[pt(cx - u * 0.4, cy - u * 0.35), pt(cx + u * 0.2, cy - u * 0.9), pt(cx + u * 0.2, cy + u * 0.9), pt(cx - u * 0.4, cy + u * 0.35)],
+                );
+                if state != 0 {
+                    stroke(&[(cx + u * 0.5, cy - u * 0.5), (cx + u * 1.1, cy + u * 0.5)]);
+                    stroke(&[(cx + u * 0.5, cy + u * 0.5), (cx + u * 1.1, cy - u * 0.5)]);
+                } else {
+                    stroke(&[(cx + u * 0.55, cy - u * 0.5), (cx + u * 0.9, cy), (cx + u * 0.55, cy + u * 0.5)]);
+                }
+            }
             Button::Toggle if playing => {
                 let (bw, gap) = (u * 0.55, u * 0.45);
                 fill(hdc, brush, cx - gap / 2.0 - bw, cy - u, cx - gap / 2.0, cy + u);
@@ -789,7 +928,7 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, play
                     fill(hdc, brush, cx - u * 0.9, y - h / 2.0, cx - u * 0.9 + u * 2.0 * half, y + h / 2.0);
                 }
             }
-            Button::Seek | Button::Pin | Button::Close => {}
+            Button::Volume | Button::Seek | Button::Pin | Button::Close => {}
         }
         SelectObject(hdc, old_pen);
         SelectObject(hdc, old_brush);
@@ -1022,7 +1161,15 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         }
 
         // Transport buttons.
-        for b in [Button::Prev, Button::Toggle, Button::Next, Button::Lyrics] {
+        for b in [
+            Button::Shuffle,
+            Button::Prev,
+            Button::Toggle,
+            Button::Next,
+            Button::Repeat,
+            Button::Mute,
+            Button::Lyrics,
+        ] {
             let rect = button_rect(hwnd, b);
             let enabled = ui.enabled(b);
             let down = ui.pressed == Some(b);
@@ -1038,14 +1185,45 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
             }
             let color = if !enabled {
                 pal.icon_off
-            } else if b == Button::Lyrics && ui.lyrics_open {
+            } else if (b == Button::Lyrics && ui.lyrics_open)
+                || (b == Button::Shuffle && ui.shuffle)
+                || (b == Button::Repeat && ui.repeat != 0)
+            {
                 accent
             } else if hot {
                 pal.icon_hot
             } else {
                 pal.icon
             };
-            draw_icon(hwnd, hdc, b, &rect, COLORREF(color), ui.playing);
+            let state = match b {
+                Button::Toggle => ui.playing as i32,
+                Button::Repeat => ui.repeat as i32,
+                Button::Mute => ui.muted as i32,
+                _ => 0,
+            };
+            draw_icon(hwnd, hdc, b, &rect, COLORREF(color), state);
+        }
+
+        // Volume slider.
+        {
+            let vr = button_rect(hwnd, Button::Volume);
+            let enabled = ui.enabled(Button::Volume);
+            let hot = enabled && (ui.hover == Some(Button::Volume) || ui.pressed == Some(Button::Volume));
+            let level = if ui.muted { 0 } else { ui.volume.max(0) };
+            let filled = ((vr.right - vr.left) as f64 * level as f64 / 100.0) as i32;
+            let th = s(if hot { 6 } else { 4 });
+            let cy = (vr.top + vr.bottom) / 2;
+            let (y0, y1) = (cy - th / 2, cy - th / 2 + th);
+            fill_round(hdc, vr.left, y0, vr.right, y1, th, pal.track);
+            if filled > 0 {
+                let color = if enabled { accent } else { pal.icon_off };
+                fill_round(hdc, vr.left, y0, vr.left + filled.max(th), y1, th, color);
+            }
+            if hot {
+                let d = s(12);
+                let x = vr.left + filled;
+                fill_round(hdc, x - d / 2, cy - d / 2, x + d / 2, cy + d / 2, d, pal.thumb);
+            }
         }
 
         // Lyrics box below the controls.
@@ -1142,6 +1320,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     ui.scrub = Some(seek_ms_at(hwnd, client_point(lparam).x, ui.dur_ms));
                     changed = true;
                 }
+                if ui.pressed == Some(Button::Volume) {
+                    set_volume_from(hwnd, ui, client_point(lparam).x);
+                    changed = true;
+                }
                 let arm = !ui.tracking;
                 ui.tracking = true;
                 if changed {
@@ -1177,6 +1359,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         ui.pressed = Some(b);
                         if b == Button::Seek {
                             ui.scrub = Some(seek_ms_at(hwnd, client_point(lparam).x, ui.dur_ms));
+                        }
+                        if b == Button::Volume {
+                            set_volume_from(hwnd, ui, client_point(lparam).x);
                         }
                     });
                     unsafe {

@@ -17,9 +17,12 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionMediaProperties as Props,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
 };
+use windows::Media::MediaPlaybackAutoRepeatMode;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::Result;
+
+use crate::volume;
 
 /// Album art is decoded once at this square size and scaled to the window when drawn.
 pub const ART_SIZE: i32 = 160;
@@ -92,6 +95,14 @@ pub struct NowPlaying {
     pub can_next: bool,
     pub can_toggle: bool,
     pub can_seek: bool,
+    pub can_shuffle: bool,
+    pub can_repeat: bool,
+    pub shuffle: bool,
+    /// 0 off, 1 repeat the track, 2 repeat the list.
+    pub repeat: u8,
+    /// Spotify's mixer volume 0..=100 and mute, or -1 when it has no audio session.
+    pub volume: i32,
+    pub muted: bool,
     /// Track length and the position at the moment this was read, in milliseconds.
     /// While playing the UI advances the position itself from its own clock.
     pub dur_ms: i64,
@@ -111,6 +122,12 @@ impl NowPlaying {
             can_next: false,
             can_toggle: false,
             can_seek: false,
+            can_shuffle: false,
+            can_repeat: false,
+            shuffle: false,
+            repeat: 0,
+            volume: -1,
+            muted: false,
             dur_ms: 0,
             pos_ms: 0,
         }
@@ -124,6 +141,12 @@ pub enum Command {
     Prev,
     /// Absolute position in milliseconds.
     Seek(i64),
+    Shuffle(bool),
+    /// 0 off, 1 track, 2 list.
+    Repeat(u8),
+    /// Mixer volume 0..=100.
+    Volume(i32),
+    Mute(bool),
 }
 
 enum Msg {
@@ -259,6 +282,12 @@ struct Key {
     can_next: bool,
     can_toggle: bool,
     can_seek: bool,
+    can_shuffle: bool,
+    can_repeat: bool,
+    shuffle: bool,
+    repeat: u8,
+    volume: i32,
+    muted: bool,
     dur_ms: i64,
 }
 
@@ -267,6 +296,9 @@ fn handle(manager: &Manager, msg: Msg) -> bool {
     match msg {
         Msg::Refresh => {}
         Msg::ResendArt => return true,
+        // Volume is the audio session, not the media session.
+        Msg::Command(Command::Volume(v)) => volume::set(v),
+        Msg::Command(Command::Mute(m)) => volume::set_mute(m),
         Msg::Command(c) => {
             if let Ok(Some(session)) = find_spotify(manager) {
                 let op = match c {
@@ -274,6 +306,13 @@ fn handle(manager: &Manager, msg: Msg) -> bool {
                     Command::Next => session.TrySkipNextAsync(),
                     Command::Prev => session.TrySkipPreviousAsync(),
                     Command::Seek(ms) => session.TryChangePlaybackPositionAsync(ms * TICKS_PER_MS),
+                    Command::Shuffle(on) => session.TryChangeShuffleActiveAsync(on),
+                    Command::Repeat(mode) => session.TryChangeAutoRepeatModeAsync(match mode {
+                        1 => MediaPlaybackAutoRepeatMode::Track,
+                        2 => MediaPlaybackAutoRepeatMode::List,
+                        _ => MediaPlaybackAutoRepeatMode::None,
+                    }),
+                    Command::Volume(_) | Command::Mute(_) => return false,
                 };
                 let _ = op.and_then(|o| o.join());
             }
@@ -299,6 +338,15 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
     let can_next = controls.IsNextEnabled()?;
     let can_toggle = controls.IsPlayEnabled()? || controls.IsPauseEnabled()?;
     let can_seek = controls.IsPlaybackPositionEnabled()?;
+    let can_shuffle = controls.IsShuffleEnabled()?;
+    let can_repeat = controls.IsRepeatEnabled()?;
+    let shuffle = info.IsShuffleActive().and_then(|v| v.Value()).unwrap_or(false);
+    let repeat = match info.AutoRepeatMode().and_then(|v| v.Value()) {
+        Ok(MediaPlaybackAutoRepeatMode::Track) => 1,
+        Ok(MediaPlaybackAutoRepeatMode::List) => 2,
+        _ => 0,
+    };
+    let (volume, muted) = volume::get().unwrap_or((-1, false));
 
     // The reported position is a snapshot taken at LastUpdatedTime; bring it up to now.
     let tl = session.GetTimelineProperties()?;
@@ -330,6 +378,12 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
         can_next,
         can_toggle,
         can_seek,
+        can_shuffle,
+        can_repeat,
+        shuffle,
+        repeat,
+        volume,
+        muted,
         dur_ms,
     };
     let np = NowPlaying {
@@ -343,6 +397,12 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
         can_next,
         can_toggle,
         can_seek,
+        can_shuffle,
+        can_repeat,
+        shuffle,
+        repeat,
+        volume,
+        muted,
         dur_ms,
         pos_ms,
     };
