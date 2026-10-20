@@ -85,6 +85,7 @@ pub struct NowPlaying {
     pub active: bool,
     pub title: String,
     pub artist: String,
+    pub album: String,
     pub art: ArtUpdate,
     pub playing: bool,
     pub can_prev: bool,
@@ -103,6 +104,7 @@ impl NowPlaying {
             active,
             title: String::new(),
             artist: String::new(),
+            album: String::new(),
             art: ArtUpdate::Clear,
             playing: false,
             can_prev: false,
@@ -289,6 +291,7 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
     let props = session.TryGetMediaPropertiesAsync()?.join()?;
     let title = props.Title()?.to_string();
     let artist = props.Artist()?.to_string();
+    let album = props.AlbumTitle()?.to_string();
     let info = session.GetPlaybackInfo()?;
     let controls = info.Controls()?;
     let playing = info.PlaybackStatus()? == Status::Playing;
@@ -333,6 +336,7 @@ fn snapshot(session: &Session, last: &Key) -> Result<(NowPlaying, Key)> {
         active: true,
         title,
         artist,
+        album,
         art,
         playing,
         can_prev,

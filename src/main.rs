@@ -1,5 +1,6 @@
 ﻿#![windows_subsystem = "windows"]
 
+mod lyrics;
 mod media;
 
 use std::cell::RefCell;
@@ -20,7 +21,8 @@ use windows::Win32::Graphics::Gdi::{
     DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
     DeleteObject, DrawTextW, Ellipse, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject,
     HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, InvalidateRect, NULL_BRUSH, NULL_PEN, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, PS_SOLID, Polygon, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, PS_SOLID,
+    Polygon, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode,
     SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -46,6 +48,10 @@ use windows::core::{BOOL, PCWSTR, PWSTR, Result, w};
 /// Logical size in device-independent pixels at 96 DPI.
 const WIDTH: i32 = 320;
 const HEIGHT: i32 = 112;
+/// Extra height while the lyrics box is open.
+const LYRICS_H: i32 = 100;
+const LYRIC_LINES: i32 = 4;
+const LYRIC_LINE_H: i32 = 20;
 const MARGIN: i32 = 16;
 const CLOSE_SIZE: i32 = 28;
 /// Album art square and the padding around it.
@@ -61,6 +67,8 @@ const CMD_QUIT: usize = 2;
 const CMD_AUTOSTART: usize = 3;
 /// Posted by a second launch to make the running instance show itself.
 const WM_SHOW_REQUEST: u32 = WM_APP + 3;
+/// Posted by the lyrics worker with a `Box<lyrics::Lyrics>` pointer in `lparam`.
+const WM_LYRICS: u32 = WM_APP + 4;
 
 /// Whether the window stays above all other windows. Off, it is an ordinary window that sits
 /// behind apps but, being a tool window, stays visible after Win+D.
@@ -93,14 +101,15 @@ fn state_path() -> Option<PathBuf> {
     Some(dir.join("window.txt"))
 }
 
-/// Saved position and topmost flag, if the file exists and the spot is still on screen.
-fn load_state() -> Option<(i32, i32, bool)> {
+/// Saved position, topmost flag and lyrics-box flag, if the file exists and the spot is still on screen.
+fn load_state() -> Option<(i32, i32, bool, bool)> {
     let text = std::fs::read_to_string(state_path()?).ok()?;
     let mut it = text.split_whitespace();
     let x: i32 = it.next()?.parse().ok()?;
     let y: i32 = it.next()?.parse().ok()?;
     // Older files wrote "1"/"0" or a mode name ("desktop" no longer exists and reads as off).
     let topmost = matches!(it.next()?, "1" | "top");
+    let lyrics = it.next() == Some("lyrics");
     let (vx, vy, vw, vh) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -110,7 +119,7 @@ fn load_state() -> Option<(i32, i32, bool)> {
         )
     };
     let visible = x >= vx - 40 && y >= vy && x < vx + vw - 40 && y < vy + vh - 40;
-    visible.then_some((x, y, topmost))
+    visible.then_some((x, y, topmost, lyrics))
 }
 
 fn save_state(hwnd: HWND) {
@@ -123,7 +132,8 @@ fn save_state(hwnd: HWND) {
         let _ = std::fs::create_dir_all(dir);
     }
     let top = if TOPMOST.load(Ordering::Relaxed) { "top" } else { "normal" };
-    let _ = std::fs::write(path, format!("{} {} {}", r.left, r.top, top));
+    let lyrics = if UI.with_borrow(|ui| ui.lyrics_open) { " lyrics" } else { "" };
+    let _ = std::fs::write(path, format!("{} {} {}{}", r.left, r.top, top, lyrics));
 }
 
 fn default_position(w: i32, h: i32) -> (i32, i32) {
@@ -350,6 +360,7 @@ enum Button {
     Toggle,
     Next,
     Seek,
+    Lyrics,
     Pin,
     Close,
 }
@@ -403,13 +414,20 @@ fn button_rect(hwnd: HWND, b: Button) -> RECT {
         Button::Toggle => ctrl(1),
         Button::Next => ctrl(2),
         Button::Seek => bar_rect(hwnd),
+        // Right of the transport buttons, with a small gap.
+        Button::Lyrics => RECT {
+            left: scale(hwnd, CTRL_LEFT + 3 * CTRL_W + 10),
+            top: scale(hwnd, CTRL_TOP),
+            right: scale(hwnd, CTRL_LEFT + 4 * CTRL_W + 10),
+            bottom: scale(hwnd, CTRL_TOP + CTRL_H),
+        },
         Button::Pin => pin_rect(hwnd),
         Button::Close => close_rect(hwnd),
     }
 }
 
 fn button_at(hwnd: HWND, p: POINT) -> Option<Button> {
-    [Button::Prev, Button::Toggle, Button::Next, Button::Seek, Button::Pin, Button::Close]
+    [Button::Prev, Button::Toggle, Button::Next, Button::Seek, Button::Lyrics, Button::Pin, Button::Close]
         .into_iter()
         .find(|&b| in_rect(&button_rect(hwnd, b), p))
 }
@@ -434,6 +452,71 @@ fn activate(hwnd: HWND, b: Button) {
         Button::Prev => media::command(media::Command::Prev),
         // Seeking is committed on mouse release, not on click.
         Button::Seek => {}
+        Button::Lyrics => {
+            UI.with_borrow_mut(|ui| {
+                ui.lyrics_open = !ui.lyrics_open;
+                ui.lyric_scroll = 0;
+                if !ui.lyrics_open {
+                    // Closing frees the text.
+                    ui.lyrics = LyricsView::Idle;
+                    ui.lyrics_key.clear();
+                }
+            });
+            resize(hwnd);
+            ensure_lyrics();
+            save_state(hwnd);
+        }
+    }
+}
+
+fn window_height() -> i32 {
+    HEIGHT + if UI.with_borrow(|ui| ui.lyrics_open) { LYRICS_H } else { 0 }
+}
+
+/// Resize to fit the lyrics box, keeping the top-left corner and staying on the work area.
+fn resize(hwnd: HWND) {
+    unsafe {
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        let (w, h) = (scale(hwnd, WIDTH), scale(hwnd, window_height()));
+        let mut y = r.top;
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            y = y.min(mi.rcWork.bottom - h).max(mi.rcWork.top);
+        }
+        let _ = SetWindowPos(hwnd, None, r.left, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    invalidate(hwnd);
+}
+
+/// Request lyrics for the current track if the box is open and we do not have them yet.
+fn ensure_lyrics() {
+    let req = UI.with_borrow_mut(|ui| {
+        let key = format!("{}\u{1}{}", ui.title, ui.artist);
+        if !ui.lyrics_open {
+            return None;
+        }
+        if !ui.active || ui.title.is_empty() {
+            ui.lyrics = LyricsView::Idle;
+            ui.lyrics_key.clear();
+            return None;
+        }
+        if ui.lyrics_key == key {
+            return None;
+        }
+        ui.lyrics_key = key.clone();
+        ui.lyrics = LyricsView::Message("Loading lyrics\u{2026}");
+        ui.lyric_scroll = 0;
+        Some(lyrics::Request {
+            key,
+            artist: ui.artist.clone(),
+            title: ui.title.clone(),
+            album: ui.album.clone(),
+            duration_ms: ui.dur_ms,
+        })
+    });
+    if let Some(r) = req {
+        lyrics::request(r);
     }
 }
 
@@ -457,11 +540,26 @@ fn sync_timer(hwnd: HWND, visible: bool) {
     });
 }
 
+/// What the lyrics box shows for the current track.
+enum LyricsView {
+    Idle,
+    Message(&'static str),
+    Synced(Vec<(i64, String)>),
+    Plain(Vec<String>),
+}
+
 /// What the window shows. Lives on the UI thread; the worker only posts updates.
 struct Ui {
     active: bool,
     title: String,
     artist: String,
+    album: String,
+    lyrics_open: bool,
+    lyrics: LyricsView,
+    /// Track the lyrics (or the pending request) belong to.
+    lyrics_key: String,
+    /// First visible line of plain lyrics.
+    lyric_scroll: i32,
     art: Option<HBITMAP>,
     playing: bool,
     can_prev: bool,
@@ -498,6 +596,11 @@ thread_local! {
             active: false,
             title: String::new(),
             artist: String::new(),
+            album: String::new(),
+            lyrics_open: false,
+            lyrics: LyricsView::Idle,
+            lyrics_key: String::new(),
+            lyric_scroll: 0,
             art: None,
             playing: false,
             can_prev: false,
@@ -530,7 +633,7 @@ impl Ui {
             Button::Next => self.can_next,
             Button::Toggle => self.can_toggle,
             Button::Seek => self.can_seek && self.dur_ms > 0,
-            Button::Pin | Button::Close => true,
+            Button::Lyrics | Button::Pin | Button::Close => true,
         }
     }
 
@@ -559,6 +662,7 @@ impl Ui {
         self.active = np.active;
         self.title = np.title;
         self.artist = np.artist;
+        self.album = np.album;
         self.playing = np.playing;
         self.can_prev = np.can_prev;
         self.can_next = np.can_next;
@@ -676,6 +780,14 @@ fn draw_icon(hwnd: HWND, hdc: HDC, b: Button, rect: &RECT, color: COLORREF, play
                     &[pt(cx + u * 0.8, cy - u * 0.8), pt(cx + u * 0.8, cy + u * 0.8), pt(cx - u * 0.5, cy)],
                 );
                 fill(hdc, brush, cx - u * 0.95, cy - u * 0.8, cx - u * 0.6, cy + u * 0.8);
+            }
+            Button::Lyrics => {
+                // Three text lines, the last one shorter.
+                let h = (u * 0.22).max(2.0);
+                for (i, half) in [(-1.0, 0.9), (0.0, 0.9), (1.0, 0.45)] {
+                    let y = cy + i * u * 0.75;
+                    fill(hdc, brush, cx - u * 0.9, y - h / 2.0, cx - u * 0.9 + u * 2.0 * half, y + h / 2.0);
+                }
             }
             Button::Seek | Button::Pin | Button::Close => {}
         }
@@ -910,7 +1022,7 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
         }
 
         // Transport buttons.
-        for b in [Button::Prev, Button::Toggle, Button::Next] {
+        for b in [Button::Prev, Button::Toggle, Button::Next, Button::Lyrics] {
             let rect = button_rect(hwnd, b);
             let enabled = ui.enabled(b);
             let down = ui.pressed == Some(b);
@@ -924,8 +1036,67 @@ fn draw(hwnd: HWND, hdc: HDC, w: i32, h: i32) {
                 SelectObject(hdc, old_brush);
                 let _ = DeleteObject(bg.into());
             }
-            let color = if !enabled { pal.icon_off } else if hot { pal.icon_hot } else { pal.icon };
+            let color = if !enabled {
+                pal.icon_off
+            } else if b == Button::Lyrics && ui.lyrics_open {
+                accent
+            } else if hot {
+                pal.icon_hot
+            } else {
+                pal.icon
+            };
             draw_icon(hwnd, hdc, b, &rect, COLORREF(color), ui.playing);
+        }
+
+        // Lyrics box below the controls.
+        if ui.lyrics_open {
+            let bx = RECT {
+                left: s(PAD),
+                top: s(HEIGHT),
+                right: s(WIDTH - PAD),
+                bottom: s(HEIGHT + LYRICS_H - PAD),
+            };
+            fill_round(hdc, bx.left, bx.top, bx.right, bx.bottom, s(10), pal.art_bg);
+            let line_h = s(LYRIC_LINE_H);
+            let top = bx.top + (bx.bottom - bx.top - line_h * LYRIC_LINES) / 2;
+            let (lx, rx) = (bx.left + s(10), bx.right - s(10));
+            let line_rect = |row: i32| RECT { left: lx, top: top + row * line_h, right: rx, bottom: top + (row + 1) * line_h };
+            match &ui.lyrics {
+                LyricsView::Idle => {}
+                LyricsView::Message(m) => {
+                    SelectObject(hdc, artist_font.into());
+                    SetTextColor(hdc, COLORREF(pal.artist));
+                    let mut r = RECT { left: lx, top: bx.top, right: rx, bottom: bx.bottom };
+                    draw_text(hdc, m, &mut r, DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+                }
+                LyricsView::Synced(lines) => {
+                    // Current line = last one that has started; one line of context above it.
+                    let cur = lines.partition_point(|(t, _)| *t <= ui.position_ms()) as i32 - 1;
+                    let start = cur.max(0) - 1;
+                    for row in 0..LYRIC_LINES {
+                        let Some((_, text)) = usize::try_from(start + row).ok().and_then(|i| lines.get(i)) else {
+                            continue;
+                        };
+                        let current = start + row == cur;
+                        SelectObject(hdc, if current { title_font } else { artist_font }.into());
+                        SetTextColor(hdc, COLORREF(if current { accent } else { pal.artist }));
+                        let mut r = line_rect(row);
+                        let text = if text.is_empty() { "\u{266A}" } else { text.as_str() };
+                        draw_text(hdc, text, &mut r, DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+                    }
+                }
+                LyricsView::Plain(lines) => {
+                    let start = ui.lyric_scroll.clamp(0, (lines.len() as i32 - LYRIC_LINES).max(0));
+                    SelectObject(hdc, artist_font.into());
+                    SetTextColor(hdc, COLORREF(pal.title));
+                    for row in 0..LYRIC_LINES {
+                        if let Some(text) = lines.get((start + row) as usize) {
+                            let mut r = line_rect(row);
+                            draw_text(hdc, text, &mut r, DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+                        }
+                    }
+                }
+            }
         }
 
         // Buttons: close (x) and pin ring.
@@ -1102,6 +1273,35 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
             UI.with_borrow_mut(|ui| ui.update(*np, visible));
             sync_timer(hwnd, visible);
+            if visible {
+                ensure_lyrics();
+            }
+            invalidate(hwnd);
+            LRESULT(0)
+        }
+        WM_LYRICS => {
+            let l = unsafe { Box::from_raw(lparam.0 as *mut lyrics::Lyrics) };
+            UI.with_borrow_mut(|ui| {
+                // Ignore answers for a track we have moved on from, or a box that was closed.
+                if ui.lyrics_open && ui.lyrics_key == l.key {
+                    ui.lyrics = match l.body {
+                        lyrics::Body::Synced(v) => LyricsView::Synced(v),
+                        lyrics::Body::Plain(v) => LyricsView::Plain(v),
+                        lyrics::Body::Message(m) => LyricsView::Message(m),
+                    };
+                }
+            });
+            invalidate(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            // Plain (unsynced) lyrics scroll with the wheel; synced ones follow the song.
+            let notches = (wparam.0 >> 16) as i16 as i32 / 120;
+            UI.with_borrow_mut(|ui| {
+                if ui.lyrics_open && matches!(ui.lyrics, LyricsView::Plain(_)) {
+                    ui.lyric_scroll = (ui.lyric_scroll - notches).max(0);
+                }
+            });
             invalidate(hwnd);
             LRESULT(0)
         }
@@ -1143,10 +1343,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 UI.with_borrow_mut(|ui| {
                     ui.art_freed = ui.art.is_some() || ui.art_freed;
                     ui.drop_art();
+                    // Lyrics text goes too; it is fetched again on show if the box is open.
+                    ui.lyrics = LyricsView::Idle;
+                    ui.lyrics_key.clear();
                 });
                 trim_memory();
-            } else if UI.with_borrow_mut(|ui| std::mem::take(&mut ui.art_freed)) {
-                media::resend_art();
+            } else {
+                if UI.with_borrow_mut(|ui| std::mem::take(&mut ui.art_freed)) {
+                    media::resend_art();
+                }
+                ensure_lyrics();
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1201,8 +1407,9 @@ fn main() -> Result<()> {
         RegisterClassW(&wc);
 
         let saved = load_state();
-        if let Some((_, _, top)) = saved {
+        if let Some((_, _, top, lyrics)) = saved {
             TOPMOST.store(top, Ordering::Relaxed);
+            UI.with_borrow_mut(|ui| ui.lyrics_open = lyrics);
         }
         let ex = WS_EX_TOOLWINDOW
             | if TOPMOST.load(Ordering::Relaxed) { WS_EX_TOPMOST } else { WINDOW_EX_STYLE(0) };
@@ -1222,8 +1429,8 @@ fn main() -> Result<()> {
             Some(instance.into()),
             None,
         )?;
-        let (w, h) = (scale(hwnd, WIDTH), scale(hwnd, HEIGHT));
-        let (x, y) = saved.map_or_else(|| default_position(w, h), |(x, y, _)| (x, y));
+        let (w, h) = (scale(hwnd, WIDTH), scale(hwnd, window_height()));
+        let (x, y) = saved.map_or_else(|| default_position(w, h), |(x, y, _, _)| (x, y));
         let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         create_tip(hwnd, instance.into())?;
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
@@ -1240,6 +1447,7 @@ fn main() -> Result<()> {
         UI.with_borrow_mut(|ui| ui.light = read_light_theme());
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         media::spawn(hwnd, WM_NOWPLAYING);
+        lyrics::spawn(hwnd, WM_LYRICS);
 
         // Blocks until a message arrives: no timers, no polling.
         let mut msg = MSG::default();

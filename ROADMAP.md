@@ -71,13 +71,13 @@ Goal: controls SMTC cannot do. Requires Premium and a one-time login.
 - [ ] Volume, shuffle, repeat, like.
 - [ ] No extra network traffic or memory when the user has not logged in.
 
-## S11: Lyrics box (todo)
+## S11: Lyrics box (doing)
 Goal: a toggle shows a small box with the lyrics of the current track.
-- [ ] Source: LRCLIB (lrclib.net), free public API, no key. The request sends artist, title, album and duration to that server. Synced lines when available, plain text as fallback, a short message when nothing is found.
-- [ ] Fetch only while the box is open, on the worker thread, with WinHTTP (no extra crate). Keep the current track's lyrics only.
-- [ ] Toggle button on the controls row. The window grows to fit the box; the setting is remembered.
-- [ ] Synced lyrics highlight the current line and follow the playback position. Reuse the existing 1 Hz timer, nothing new when the box is closed.
-- [ ] Hide to tray or closing the box frees the lyrics text.
+- [x] Source: LRCLIB (lrclib.net), free public API, no key. The request sends artist, title, album and duration to that server. Synced lines when available, plain text as fallback, a short message when nothing is found.
+- [x] Fetch only while the box is open, on the worker thread, with WinHTTP (no extra crate). Keep the current track's lyrics only.
+- [x] Toggle button on the controls row. The window grows to fit the box; the setting is remembered.
+- [x] Synced lyrics highlight the current line and follow the playback position. Reuse the existing 1 Hz timer, nothing new when the box is closed.
+- [x] Hide to tray or closing the box frees the lyrics text.
 
 ## S10: Efficiency pass and release (todo)
 Goal: measure and lock in the budget.
