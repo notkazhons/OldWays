@@ -1,118 +1,435 @@
-﻿use std::sync::mpsc::{self, Sender};
+﻿#![windows_subsystem = "windows"]
 
-use windows::Foundation::TypedEventHandler;
-use windows::Media::Control::{
-    GlobalSystemMediaTransportControlsSession as Session,
-    GlobalSystemMediaTransportControlsSessionManager as Manager,
-    GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateBitmap, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    DeleteObject, DrawTextW, Ellipse, EndPaint, GetStockObject, InvalidateRect, NULL_BRUSH,
+    PAINTSTRUCT, PS_SOLID, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::core::Result;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
+};
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{PWSTR, Result, w};
 
-/// Event registrations on one session; removed when the session goes away.
-struct Subscription {
-    session: Session,
-    media: i64,
-    playback: i64,
-    timeline: i64,
+/// Logical size in device-independent pixels at 96 DPI.
+const WIDTH: i32 = 320;
+const HEIGHT: i32 = 96;
+const MARGIN: i32 = 16;
+const CLOSE_SIZE: i32 = 28;
+
+/// Tray icon callback message and menu command ids.
+const WM_TRAY: u32 = WM_APP + 1;
+const CMD_TOGGLE: usize = 1;
+const CMD_QUIT: usize = 2;
+
+/// Whether the window stays above all other windows. Off, it is an ordinary window that sits
+/// behind apps but, being a tool window, stays visible after Win+D.
+static TOPMOST: AtomicBool = AtomicBool::new(true);
+static TIP: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+fn scale(hwnd: HWND, v: i32) -> i32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) } as i32;
+    v * dpi.max(96) / 96
 }
 
-impl Subscription {
-    fn new(session: Session, tx: &Sender<()>) -> Result<Self> {
-        let t = tx.clone();
-        let media = session.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = t.send(());
-            Ok(())
-        }))?;
-        let t = tx.clone();
-        let playback = session.PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = t.send(());
-            Ok(())
-        }))?;
-        let t = tx.clone();
-        let timeline = session.TimelinePropertiesChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = t.send(());
-            Ok(())
-        }))?;
-        Ok(Self { session, media, playback, timeline })
+fn close_rect(hwnd: HWND) -> RECT {
+    let (w, s) = (scale(hwnd, WIDTH), scale(hwnd, CLOSE_SIZE));
+    RECT { left: w - s, top: 0, right: w, bottom: s }
+}
+
+/// Pin button, left of the close button. Bright ring = always on top, dim ring = normal window.
+fn pin_rect(hwnd: HWND) -> RECT {
+    let c = close_rect(hwnd);
+    RECT { left: c.left - (c.right - c.left), top: c.top, right: c.left, bottom: c.bottom }
+}
+
+fn in_rect(r: &RECT, p: POINT) -> bool {
+    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+}
+
+fn state_path() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("music-player-widget");
+    Some(dir.join("window.txt"))
+}
+
+/// Saved position and topmost flag, if the file exists and the spot is still on screen.
+fn load_state() -> Option<(i32, i32, bool)> {
+    let text = std::fs::read_to_string(state_path()?).ok()?;
+    let mut it = text.split_whitespace();
+    let x: i32 = it.next()?.parse().ok()?;
+    let y: i32 = it.next()?.parse().ok()?;
+    // Older files wrote "1"/"0" or a mode name ("desktop" no longer exists and reads as off).
+    let topmost = matches!(it.next()?, "1" | "top");
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let visible = x >= vx - 40 && y >= vy && x < vx + vw - 40 && y < vy + vh - 40;
+    visible.then_some((x, y, topmost))
+}
+
+fn save_state(hwnd: HWND) {
+    let Some(path) = state_path() else { return };
+    let mut r = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let top = if TOPMOST.load(Ordering::Relaxed) { "top" } else { "normal" };
+    let _ = std::fs::write(path, format!("{} {} {}", r.left, r.top, top));
+}
+
+fn default_position(w: i32, h: i32) -> (i32, i32) {
+    let mut work = RECT::default();
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut RECT as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    (work.right - w - MARGIN, work.bottom - h - MARGIN)
+}
+
+fn set_topmost(hwnd: HWND, on: bool) {
+    TOPMOST.store(on, Ordering::Relaxed);
+    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    unsafe {
+        let _ = SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    update_tip(hwnd);
+}
+
+fn tip_info(hwnd: HWND, text: &mut Vec<u16>) -> TTTOOLINFOW {
+    TTTOOLINFOW {
+        cbSize: size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TTF_SUBCLASS,
+        hwnd,
+        uId: 1,
+        rect: pin_rect(hwnd),
+        lpszText: PWSTR(text.as_mut_ptr()),
+        ..Default::default()
     }
 }
 
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        let _ = self.session.RemoveMediaPropertiesChanged(self.media);
-        let _ = self.session.RemovePlaybackInfoChanged(self.playback);
-        let _ = self.session.RemoveTimelinePropertiesChanged(self.timeline);
+fn tip_text() -> Vec<u16> {
+    let s = if TOPMOST.load(Ordering::Relaxed) {
+        "Above all windows (click: normal window)"
+    } else {
+        "Normal window, stays after Win+D (click: above all windows)"
+    };
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+fn update_tip(hwnd: HWND) {
+    let tip = HWND(TIP.load(Ordering::Relaxed) as *mut _);
+    if tip.0.is_null() {
+        return;
+    }
+    let mut text = tip_text();
+    let ti = tip_info(hwnd, &mut text);
+    let lp = LPARAM(&ti as *const _ as isize);
+    unsafe {
+        SendMessageW(tip, TTM_UPDATETIPTEXTW, None, Some(lp));
+        SendMessageW(tip, TTM_NEWTOOLRECTW, None, Some(lp));
     }
 }
 
-fn find_spotify(manager: &Manager) -> Result<Option<Session>> {
-    for session in manager.GetSessions()? {
-        if session.SourceAppUserModelId()?.to_string().to_lowercase().contains("spotify") {
-            return Ok(Some(session));
+/// Native tooltip window, created once; the pin button is its only tool.
+fn create_tip(hwnd: HWND, instance: HINSTANCE) -> Result<()> {
+    unsafe {
+        let icc = INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_WIN95_CLASSES,
+        };
+        let _ = InitCommonControlsEx(&icc);
+        let tip = CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASS,
+            None,
+            WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            Some(hwnd),
+            None,
+            Some(instance),
+            None,
+        )?;
+        TIP.store(tip.0 as isize, Ordering::Relaxed);
+        let mut text = tip_text();
+        let ti = tip_info(hwnd, &mut text);
+        SendMessageW(tip, TTM_ADDTOOLW, None, Some(LPARAM(&ti as *const _ as isize)));
+    }
+    Ok(())
+}
+
+/// 32x32 green play triangle, built in memory so the exe needs no icon resource.
+fn make_icon() -> Result<HICON> {
+    const N: usize = 32;
+    let mut px = [0u32; N * N];
+    for y in 0..N {
+        for x in 0..N {
+            // Triangle with vertices (8,5), (8,26), (26,15.5).
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let half = (26.0 - fx) / 18.0 * 10.5;
+            if (8.0..=26.0).contains(&fx) && (fy - 15.5).abs() <= half {
+                px[y * N + x] = 0xFF1DB954;
+            }
         }
     }
-    Ok(None)
+    unsafe {
+        let color = CreateBitmap(N as i32, N as i32, 1, 32, Some(px.as_ptr() as *const _));
+        let mask = CreateBitmap(N as i32, N as i32, 1, 1, None);
+        let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+        let icon = CreateIconIndirect(&info);
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        icon
+    }
 }
 
-fn describe(session: &Session) -> Result<String> {
-    let props = session.TryGetMediaPropertiesAsync()?.join()?;
-    let status = match session.GetPlaybackInfo()?.PlaybackStatus()? {
-        Status::Playing => "playing",
-        Status::Paused => "paused",
-        Status::Stopped => "stopped",
-        _ => "other",
-    };
-    let timeline = session.GetTimelineProperties()?;
-    let secs = |d: windows::Foundation::TimeSpan| d.Duration / 10_000_000;
-    let (pos, end) = (secs(timeline.Position()?), secs(timeline.EndTime()?));
-    Ok(format!(
-        "{status} | {} - {} | {} | {}:{:02} / {}:{:02}",
-        props.Title()?,
-        props.Artist()?,
-        props.AlbumTitle()?,
-        pos / 60,
-        pos % 60,
-        end / 60,
-        end % 60,
-    ))
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        ..Default::default()
+    }
+}
+
+fn add_tray(hwnd: HWND, icon: HICON) {
+    let mut nid = tray_data(hwnd);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
+    nid.hIcon = icon;
+    for (dst, src) in nid.szTip.iter_mut().zip("Music Player Widget".encode_utf16()) {
+        *dst = src;
+    }
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    }
+}
+
+fn remove_tray(hwnd: HWND) {
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+    }
+}
+
+fn toggle_visible(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, if IsWindowVisible(hwnd).as_bool() { SW_HIDE } else { SW_SHOWNOACTIVATE });
+    }
+}
+
+fn cursor() -> POINT {
+    let mut p = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut p);
+    }
+    p
+}
+
+fn tray_menu(hwnd: HWND) {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let label = if IsWindowVisible(hwnd).as_bool() { w!("Hide") } else { w!("Show") };
+        let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE, label);
+        let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit"));
+        let p = cursor();
+        // The menu only closes on an outside click if our window is foreground.
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        match cmd.0 as usize {
+            CMD_TOGGLE => toggle_visible(hwnd),
+            CMD_QUIT => {
+                let _ = DestroyWindow(hwnd);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn client_point(lparam: LPARAM) -> POINT {
+    POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 }
+}
+
+extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => {
+            // Whole window drags like a title bar, except the buttons.
+            let mut p = POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 };
+            unsafe {
+                let _ = ScreenToClient(hwnd, &mut p);
+            }
+            let button = in_rect(&close_rect(hwnd), p) || in_rect(&pin_rect(hwnd), p);
+            LRESULT(if button { HTCLIENT } else { HTCAPTION } as isize)
+        }
+        WM_LBUTTONUP => {
+            let p = client_point(lparam);
+            if in_rect(&close_rect(hwnd), p) {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            } else if in_rect(&pin_rect(hwnd), p) {
+                set_topmost(hwnd, !TOPMOST.load(Ordering::Relaxed));
+                save_state(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            save_state(hwnd);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let r = unsafe { &*(lparam.0 as *const RECT) };
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            update_tip(hwnd);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, COLORREF(0x00D0D0D0));
+                let mut x: [u16; 1] = [0x00D7];
+                let mut r = close_rect(hwnd);
+                DrawTextW(hdc, &mut x, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+                let on = TOPMOST.load(Ordering::Relaxed);
+                let color = COLORREF(if on { 0x00D0D0D0 } else { 0x00707070 });
+                let pen = CreatePen(PS_SOLID, scale(hwnd, 2), color);
+                let old_pen = SelectObject(hdc, pen.into());
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let (p, d) = (pin_rect(hwnd), scale(hwnd, 10));
+                let (cx, cy) = ((p.left + p.right) / 2, (p.top + p.bottom) / 2);
+                let _ = Ellipse(hdc, cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2);
+                SelectObject(hdc, old_pen);
+                SelectObject(hdc, old_brush);
+                let _ = DeleteObject(pen.into());
+                let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        WM_TRAY => {
+            match lparam.0 as u32 {
+                WM_LBUTTONUP => toggle_visible(hwnd),
+                WM_RBUTTONUP => tray_menu(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            save_state(hwnd);
+            remove_tray(hwnd);
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        // Explorer restarted: its tray is empty again.
+        _ if msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            if let Ok(icon) = make_icon() {
+                add_tray(hwnd, icon);
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
 }
 
 fn main() -> Result<()> {
-    let (tx, rx) = mpsc::channel::<()>();
-    let manager = Manager::RequestAsync()?.join()?;
-
-    let t = tx.clone();
-    manager.SessionsChanged(&TypedEventHandler::new(move |_, _| {
-        let _ = t.send(());
-        Ok(())
-    }))?;
-
-    let mut sub: Option<Subscription> = None;
-    let mut last = String::new();
-    loop {
-        let line = match find_spotify(&manager)? {
-            Some(session) => {
-                let same = sub.as_ref().is_some_and(|s| {
-                    s.session.SourceAppUserModelId().ok() == session.SourceAppUserModelId().ok()
-                });
-                if !same {
-                    sub = Some(Subscription::new(session.clone(), &tx)?);
-                }
-                describe(&session).unwrap_or_else(|e| format!("error: {e}"))
-            }
-            None => {
-                sub = None;
-                "Spotify not running".to_string()
-            }
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let instance = GetModuleHandleW(None)?;
+        let class = w!("MusicPlayerWidget");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hbrBackground: CreateSolidBrush(COLORREF(0x00201C1A)),
+            ..Default::default()
         };
-        if line != last {
-            println!("{line}");
-            last = line;
+        RegisterClassW(&wc);
+
+        let saved = load_state();
+        if let Some((_, _, top)) = saved {
+            TOPMOST.store(top, Ordering::Relaxed);
         }
-        // Block until the next SMTC event; no polling.
-        if rx.recv().is_err() {
-            return Ok(());
+        let ex = WS_EX_TOOLWINDOW
+            | if TOPMOST.load(Ordering::Relaxed) { WS_EX_TOPMOST } else { WINDOW_EX_STYLE(0) };
+
+        // Create at 96 DPI size, then resize once the window knows its monitor's DPI.
+        let hwnd = CreateWindowExW(
+            ex,
+            class,
+            w!("Music Player Widget"),
+            WS_POPUP,
+            0,
+            0,
+            WIDTH,
+            HEIGHT,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+        let (w, h) = (scale(hwnd, WIDTH), scale(hwnd, HEIGHT));
+        let (x, y) = saved.map_or_else(|| default_position(w, h), |(x, y, _)| (x, y));
+        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        create_tip(hwnd, instance.into())?;
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+        add_tray(hwnd, make_icon()?);
+
+        let round = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &round as *const _ as *const _,
+            size_of_val(&round) as u32,
+        );
+
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+        // Blocks until a message arrives: no timers, no polling.
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
-        while rx.try_recv().is_ok() {}
     }
+    Ok(())
 }

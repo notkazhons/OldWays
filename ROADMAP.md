@@ -18,13 +18,19 @@ Goal: read Spotify state through SMTC from a console binary, no UI yet.
 - [x] Print a new line when the track or state changes (event driven, no polling loop).
 - [x] Prints a clear message when Spotify is not running, and recovers when it starts.
 
-## S3: Basic window (todo)
+## S3: Basic window (done)
 Goal: a small borderless Win32 window with no content logic.
-- [ ] Fixed size, borderless, rounded corners, topmost option.
-- [ ] Draggable by clicking anywhere. Position saved and restored.
-- [ ] Close with a small button or Alt+F4. No taskbar entry option.
-- [ ] No timers running while idle.
+- [x] Fixed size, borderless, rounded corners, topmost option.
+- [x] Draggable by clicking anywhere. Position saved and restored.
+- [x] Close with a small button or Alt+F4. No taskbar entry option.
+- [x] No timers running while idle.
 
+## S3b: Pin button and tray (done)
+Goal: control placement and visibility without a taskbar button.
+- [x] Pin button toggles above all windows (bright ring) and normal window (dim ring). Hover tooltip names the state.
+- [x] A normal window still stays visible after Win+D and stays behind apps (tested), so no desktop-layer attach is needed. Attaching as a child of the desktop view was tried and dropped: Windows rescaled its position under 125% display scaling and it drew nothing.
+- [x] Tray icon: left click hides or shows, right click menu has Hide/Show and Quit. Icon is re-added after an Explorer restart.
+- [x] Placement and mode are restored on launch.
 ## S4: Show now playing (todo)
 Goal: draw track info in the window.
 - [ ] Title and artist text, truncated with ellipsis when too long.
@@ -54,7 +60,7 @@ Goal: make it look good without costing memory.
 
 ## S8: Tray and behavior (todo)
 Goal: stay out of the way.
-- [ ] Tray icon with show/hide and quit.
+- [x] Tray icon with show/hide and quit (done in S3b).
 - [ ] Optional start with Windows.
 - [ ] Single instance only.
 - [ ] Hide to tray frees the album art bitmap.
